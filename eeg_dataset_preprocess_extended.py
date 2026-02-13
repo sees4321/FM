@@ -19,10 +19,8 @@ CONFIG = {
     # --------------------------------------------------------------------------
     # [NEW] 파일 형식 및 데이터 소스 설정
     # --------------------------------------------------------------------------
-    # "ROOT_DIR": "D:/open_eeg_/siena-eeg",           # 데이터가 있는 최상위 폴더
-    # "OUTPUT_PATTERN": "D:/open_eeg_pp/physionet_siena/eeg-%06d.tar", # 결과 파일 패턴
-    "ROOT_DIR": "C:\\Users\\user\\mne_data\\MNE-gigadb-data\\gigadb-datasets\\live\\pub\\10.5524\\100001_101000\\100295\\mat_data",           # 데이터가 있는 최상위 폴더
-    "OUTPUT_PATTERN": "D:/open_eeg_pp/cho2017/eeg-%06d.tar", # 결과 파일 패턴
+    "ROOT_DIR": "D:/open_eeg_/siena-eeg",           # 데이터가 있는 최상위 폴더
+    "OUTPUT_PATTERN": "D:/open_eeg_pp/physionet_siena/eeg-%06d.tar", # 결과 파일 패턴
     
     # 처리할 파일 확장자 (".edf", ".mat", ".tsv", ".csv", ".txt")
     "FILE_EXT": "*.mat", 
