@@ -22,7 +22,7 @@ CONFIG = {
     "ROOT_DIR": "D:/open_eeg/ds005506",           # 데이터가 있는 최상위 폴더
     "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds005506/eeg-%06d.tar", # 결과 파일 패턴
 
-    "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    "montage": "GSN-HydroCel-129", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     # "montage": "biosemi256", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     
     # 처리할 파일 확장자 (".edf", ".set", ".mat", ".tsv", ".csv", ".txt", ".bdf", ".vhdr" 등)
@@ -311,7 +311,7 @@ def process_single_file(file_path):
              raw._data = raw._data.astype(np.float32)
 
         # 1. 채널 이름 정리 (EDF는 필수, 나머지도 포맷팅 위해 수행)
-        raw = clean_channel_names(raw)
+        # raw = clean_channel_names(raw)
 
         try:
         # 3. Standard-1005 몽타주 적용 (좌표 매핑의 핵심)
@@ -350,7 +350,7 @@ def process_single_file(file_path):
         )
         
         # processed_full = preprocessor.apply(data[:,200*5:], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
-        processed_full = preprocessor.apply(data, sfreq)
+        processed_full = preprocessor.apply(data[:128,:], sfreq)
 
 
         # 세그멘테이션
@@ -367,7 +367,7 @@ def process_single_file(file_path):
         parent_folder = os.path.basename(os.path.dirname(file_path))
         
         num_segments = total_length // window_samples
-        coords_array = np.array(valid_coords, dtype=np.float16)
+        coords_array = np.array(valid_coords[:128], dtype=np.float16)
         if processed_full.shape[-2] != len(coords_array):
             print(f"{file_path}: Shape mismatch after preprocessing, maybe channel error. Expected {len(coords_array)} channels, got {processed_full.shape[-2]}")
             return None
