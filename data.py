@@ -1,16 +1,18 @@
-
 # eeg_fm/data.py
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
+import numpy as np
 import os
 import random
 import shutil
-from typing import Any, Dict, Iterable, Iterator, List, Optional
-
-import numpy as np
+import time
 import torch
+
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 try:
     import webdataset as wds
@@ -21,6 +23,19 @@ except Exception:
 EEG_KEY = "eeg.npy"
 COORD_KEY = "coord.npy"
 META_KEY = "meta.json"
+
+@contextmanager
+def _file_lock(lock_path: str):
+    # Linux 전제. 없으면 락 없이 동작(최악에도 try/except로 안전하게)
+    try:
+        import fcntl
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        with open(lock_path, "w") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            yield
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        yield
 
 
 def find_shards(data_root: str, shard_glob: str) -> List[str]:
@@ -62,12 +77,11 @@ def decode_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
 
     eeg = _as_torch(eeg).to(torch.float16)     # stored float16
     coord = _as_torch(coord).to(torch.float32)
-    coord = coord - coord.mean(dim=0, keepdim=True)
-    coord = coord / (coord.norm(dim=-1).mean().clamp_min(1e-6))
+    coord = coord * 10 # (0.1m -> 1.0)
+    # coord = coord - coord.mean(dim=0, keepdim=True)
+    # coord = coord / (coord.norm(dim=-1).mean().clamp_min(1e-6))
 
     return {"eeg": eeg, "coord": coord, "meta": meta}
-
-
 
 
 def compute_num_patches(T: int, patch_samples: int, hop_samples: int) -> int:
@@ -256,20 +270,163 @@ def collate_pad(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: in
         "n_patches": n_patches,
     }
 
-def collate_stack(batch, patch_samples, hop_samples):
-    # 여기서는 모든 샘플이 동일 (C,P)라고 가정
-    B = len(batch)
-    C = batch[0]["n_channels"]
-    P = batch[0]["n_patches"]
-    T_need = (P-1)*hop_samples + patch_samples
+def collate_stack(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: int) -> Dict[str, Any]:
+    """
+    (C,P) 동일 shape 배치 전용 collate. padding 없이 stack.
+    - batch 내 모든 샘플의 n_channels, n_patches가 동일해야 함.
+    """
+    assert len(batch) > 0
+    C = int(batch[0]["n_channels"])
+    P = int(batch[0]["n_patches"])
+    for b in batch:
+        assert int(b["n_channels"]) == C and int(b["n_patches"]) == P, "ShapeBatcher produced mixed (C,P) batch"
 
-    eeg = torch.stack([b["eeg"][:, :T_need] for b in batch], dim=0)    # (B,C,T)
-    coord = torch.stack([b["coord"] for b in batch], dim=0)           # (B,C,3)
+    T_need = (P - 1) * hop_samples + patch_samples if P > 0 else 0
+
+    eeg = torch.stack([b["eeg"][:, :T_need].contiguous() for b in batch], dim=0)    # (B,C,T)
+    coord = torch.stack([b["coord"].contiguous() for b in batch], dim=0)           # (B,C,3)
+
+    B = len(batch)
     n_channels = torch.full((B,), C, dtype=torch.long)
     n_patches = torch.full((B,), P, dtype=torch.long)
-    return {"eeg": eeg, "coord": coord, "n_channels": n_channels, "n_patches": n_patches}
+
+    return {
+        "eeg": eeg,
+        "coord": coord,
+        "n_channels": n_channels,
+        "n_patches": n_patches,
+    }
+
+
+class LRUShardCache:
+    """
+    On-demand shard cache with LRU eviction by mtime.
+    - shard path -> cached path
+    - copy on miss (atomic rename)
+    - touch(mtime) on access
+    - evict oldest until total_bytes <= max_bytes
+
+    NOTE:
+      - basename 충돌 방지 위해 full path hash prefix 사용
+      - 멀티프로세스/멀티워커 레이스는 lock + atomic rename + try/except로 완화
+    """
+    def __init__(
+        self,
+        cache_dir: str,
+        max_bytes: int,                 # e.g. 500 * 1024**3
+        eviction_interval: int = 64,     # 매 N번 access마다 eviction check
+        enable_eviction: bool = True,
+    ):
+        self.cache_dir = cache_dir
+        self.max_bytes = int(max_bytes)
+        self.eviction_interval = int(eviction_interval)
+        self.enable_eviction = bool(enable_eviction)
+
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.lock_path = os.path.join(self.cache_dir, ".lru.lock")
+        self._counter = 0
+
+    def __call__(self, shard_path: str) -> str:
+        return self.get(shard_path)
+
+    def _cache_name(self, shard_path: str) -> str:
+        h = hashlib.sha1(shard_path.encode("utf-8")).hexdigest()[:16]
+        base = os.path.basename(shard_path)
+        return f"{h}-{base}"
+
+    def get(self, shard_path: str) -> str:
+        cached = os.path.join(self.cache_dir, self._cache_name(shard_path))
+
+        if not os.path.exists(cached):
+            tmp = cached + f".tmp.{os.getpid()}"
+            try:
+                shutil.copyfile(shard_path, tmp)
+                # atomic replace
+                os.replace(tmp, cached)
+            except FileExistsError:
+                pass
+            except Exception:
+                # 다른 프로세스가 먼저 만들어놓은 경우 등: tmp 정리 후 진행
+                pass
+            finally:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+
+        # touch: LRU 위해 mtime 갱신
+        try:
+            os.utime(cached, None)
+        except Exception:
+            pass
+
+        self._counter += 1
+        if self.enable_eviction and (self._counter % self.eviction_interval == 0):
+            self.evict_if_needed()
+
+        return cached
+
+    def evict_if_needed(self) -> None:
+        if self.max_bytes <= 0:
+            return
+
+        with _file_lock(self.lock_path):
+            # 캐시 파일 목록(임시파일 제외)
+            files = []
+            total = 0
+            for name in os.listdir(self.cache_dir):
+                if name.endswith(".tmp") or ".tmp." in name:
+                    continue
+                path = os.path.join(self.cache_dir, name)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    st = os.stat(path)
+                except FileNotFoundError:
+                    continue
+                files.append((st.st_mtime, st.st_size, path))
+                total += st.st_size
+
+            if total <= self.max_bytes:
+                return
+
+            # 오래된 것부터 삭제
+            files.sort(key=lambda x: x[0])  # oldest mtime first
+            for _, sz, path in files:
+                try:
+                    os.remove(path)
+                    total -= sz
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+                if total <= self.max_bytes:
+                    break
+
 
 class ShapeBatcher:
+    """
+    (C,P) 완전 동일 shape 기준으로 배치 생성:
+      key = (n_channels, n_patches)
+
+    - tokens_per_batch 목표에 맞춰 shape별 batch size를 자동 결정:
+        bs_target = floor(tokens_per_batch / (C*P))
+        (최소 1, 최대 max_samples_per_batch)
+
+    - 희귀 shape가 계속 쌓이지 않도록 flush 정책:
+      1) max_wait_samples:
+         어떤 key에 첫 샘플이 들어온 뒤, global seen count 기준으로 max_wait_samples 이상 지나도
+         batch가 안 채워지면 "현재까지 모인 것"을 작은 배치로 방출(yield)하고 비움.
+      2) max_pending_samples / max_pending_tokens:
+         전체 버퍼에 쌓인 샘플(또는 토큰)이 너무 많아지면 가장 오래된 key부터 강제 flush.
+
+    - flush_check_every:
+         매 샘플마다 모든 key를 검사하면 비효율이므로, N샘플마다 한 번만 expired 검사를 수행.
+
+    NOTE:
+      flush로 작은 배치가 나올 수 있음 -> token-budget 누적 step(train.py)과 같이 쓰는 게 정석.
+    """
     def __init__(
         self,
         dataset: Iterable[Dict[str, Any]],
@@ -277,27 +434,145 @@ class ShapeBatcher:
         max_samples_per_batch: int,
         patch_samples: int,
         hop_samples: int,
+        # flush 정책
+        max_wait_samples: int = 5000,
+        flush_check_every: int = 256,
+        max_pending_samples: int = 512,
+        max_pending_tokens: int = 0,      # 0이면 비활성
+        # 기타
+        shuffle_within_bucket: bool = True,
+        yield_incomplete: bool = True,    # False면 flush 시 버림(drop)
     ):
         self.dataset = dataset
         self.tokens_per_batch = int(tokens_per_batch)
         self.max_samples_per_batch = int(max_samples_per_batch)
-        self.hop_samples = int(hop_samples)
         self.patch_samples = int(patch_samples)
+        self.hop_samples = int(hop_samples)
 
-    def __iter__(self):
-        buckets = dict()  # key -> list
+        self.max_wait_samples = int(max_wait_samples)
+        self.flush_check_every = int(flush_check_every)
+        self.max_pending_samples = int(max_pending_samples)
+        self.max_pending_tokens = int(max_pending_tokens)
+
+        self.shuffle_within_bucket = bool(shuffle_within_bucket)
+        self.yield_incomplete = bool(yield_incomplete)
+
+        assert self.tokens_per_batch > 0
+        assert self.max_samples_per_batch > 0
+        assert self.flush_check_every > 0
+
+    def _target_bs(self, C: int, P: int) -> int:
+        tokens_per_sample = C * P
+        if tokens_per_sample <= 0:
+            return 1
+        bs = self.tokens_per_batch // tokens_per_sample
+        bs = max(1, bs)
+        bs = min(bs, self.max_samples_per_batch)
+        return bs
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        buckets: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+        first_seen: Dict[Tuple[int, int], int] = {}
+
+        seen = 0
+        pending_samples = 0
+        pending_tokens = 0
+
+        def _flush_key(key: Tuple[int, int]):
+            nonlocal pending_samples, pending_tokens
+            buf = buckets.pop(key, [])
+            first_seen.pop(key, None)
+            if not buf:
+                return
+
+            pending_samples -= len(buf)
+            pending_tokens -= sum(int(x.get("n_tokens", 0)) for x in buf)
+
+            if self.yield_incomplete:
+                yield collate_stack(buf, patch_samples=self.patch_samples, hop_samples=self.hop_samples)
+            # else: drop
+
+        def _flush_oldest_until_under_limits():
+            nonlocal pending_samples, pending_tokens
+            # pending_samples / pending_tokens가 상한을 넘으면 oldest key부터 flush
+            while True:
+                over_samples = (self.max_pending_samples > 0) and (pending_samples > self.max_pending_samples)
+                over_tokens = (self.max_pending_tokens > 0) and (pending_tokens > self.max_pending_tokens)
+                if not (over_samples or over_tokens):
+                    break
+                if not first_seen:
+                    break
+                oldest = min(first_seen, key=first_seen.get)
+                for out in _flush_key(oldest):
+                    yield out
+
+        def _flush_expired():
+            if self.max_wait_samples <= 0:
+                return
+            # seen 기준으로 오래된 key flush
+            expired = []
+            for k, t0 in first_seen.items():
+                if (seen - t0) >= self.max_wait_samples:
+                    expired.append(k)
+            for k in expired:
+                for out in _flush_key(k):
+                    yield out
+
         for ex in self.dataset:
-            C = ex["n_channels"]; P = ex["n_patches"]
+            seen += 1
+
+            C = int(ex.get("n_channels", 0))
+            P = int(ex.get("n_patches", 0))
+            if C <= 0 or P <= 0:
+                continue
+
             key = (C, P)
-            buckets.setdefault(key, []).append(ex)
+            if key not in buckets:
+                buckets[key] = []
+                first_seen[key] = seen
 
-            tokens_per_sample = C * P
-            bs = max(1, min(self.max_samples_per_batch, self.tokens_per_batch // tokens_per_sample))
+            buckets[key].append(ex)
+            pending_samples += 1
+            pending_tokens += int(ex.get("n_tokens", C * P))
 
-            if len(buckets[key]) >= bs:
-                batch = buckets[key][:bs]
-                buckets[key] = buckets[key][bs:]
-                yield collate_stack(batch)  # padding 없이 stack
+            # shape별 목표 batch size
+            bs_target = self._target_bs(C, P)
+
+            # 충분히 모이면 즉시 방출(가능하면 여러 배치)
+            buf = buckets[key]
+            if self.shuffle_within_bucket and len(buf) == bs_target:
+                random.shuffle(buf)
+
+            while len(buf) >= bs_target:
+                batch = buf[:bs_target]
+                del buf[:bs_target]
+                pending_samples -= bs_target
+                pending_tokens -= sum(int(x.get("n_tokens", C * P)) for x in batch)
+
+                yield collate_stack(batch, patch_samples=self.patch_samples, hop_samples=self.hop_samples)
+
+                # 남은 게 있으면 wait 타이머 리셋(남은 샘플들이 바로 flush되지 않게)
+                if len(buf) > 0:
+                    first_seen[key] = seen
+                else:
+                    buckets.pop(key, None)
+                    first_seen.pop(key, None)
+                    break
+
+            # (1) 버퍼가 너무 커지면 oldest flush
+            for out in _flush_oldest_until_under_limits():
+                yield out
+
+            # (2) 주기적으로 expired flush
+            if (seen % self.flush_check_every) == 0:
+                for out in _flush_expired():
+                    yield out
+
+        # dataset이 finite일 경우 마지막에 남은 것 flush
+        if self.yield_incomplete:
+            for k in list(buckets.keys()):
+                for out in _flush_key(k):
+                    yield out
 
 class AdaptiveTokenBucketBatcher:
     """
@@ -414,30 +689,24 @@ def build_webdataset(
     hop_samples: int,
     enable_channel_grouping: bool,
     limit_num_samples: int = 0,
+    cache_max_bytes: int = 0, # ex: 500GB -> 500*1024**3
+    post_split_shuffle: int = 256,
+    eviction_interval: int = 8,
 ) -> Iterable[Dict[str, Any]]:
     if wds is None:
         raise RuntimeError("webdataset is not installed. pip install webdataset")
 
-    # (간단) cache: 샤드 리스트를 cache로 복사해 경로를 바꿔치기
-    # NOTE: 실제 운영에서는 on-demand/LRU로 바꾸는 걸 추천.
-    if cache_dir is not None and len(shards) > 0 and os.path.isfile(shards[0]):
-        cached_shards = [cache_shard_to_ssd(s, cache_dir) for s in shards]
-    else:
-        cached_shards = shards
-
-    ds = wds.WebDataset(cached_shards, resampled=True, handler=wds.ignore_and_continue)
-    ds = ds.shuffle(shard_shuffle)
-
-    # decode explicitly (robust)
-    ds = ds.decode(wds.numpy_loads, wds.json_loads)
-
-    ds = ds.map(decode_sample)
-
-    # 60/30 -> 10 split
-    ds = ds.flatmap(lambda ex: maybe_split_long_to_base(ex, base_seconds=base_seconds, split_prob=split_long_prob))
-
-    # split 이후 shuffle(연속 chunk 방지)
-    ds = ds.shuffle(sample_shuffle)
+    # on-demand LRU cache
+    cache = None
+    if cache_dir and cache_max_bytes > 0:
+        # eviction은 LOCAL_RANK==0만 하게 하면 thrash가 줄어듦(선택)
+        enable_evict = (int(os.environ.get("LOCAL_RANK", "0")) == 0)
+        cache = LRUShardCache(
+            cache_dir=cache_dir,
+            max_bytes=cache_max_bytes,
+            eviction_interval=eviction_interval,
+            enable_eviction=enable_evict,
+        )
 
     def _prep(ex):
         if enable_channel_grouping:
@@ -451,7 +720,34 @@ def build_webdataset(
             ex["n_channels"] = int(C)
         return ex
 
-    ds = ds.map(_prep)
+    # ---- Recommended pipeline: shard-level shuffle -> split_by_node/worker -> (optional) cache -> tar -> sample shuffle(before decode) ----
+    src = wds.ResampledShards(shards)  # infinite pretrain
+    pipeline = [
+        src,
+        # shard-level shuffle (decode 이전, 가장 가벼움)
+        # webdataset에 detshuffle이 있으면 그걸 추천 (재현/분산에서 안정)
+        wds.shuffle(shard_shuffle),
+        wds.split_by_node,
+        wds.split_by_worker,
+    ]
+
+    if cache is not None:
+        # shard url(str) -> cached path(str)
+        pipeline.append(wds.map(cache))
+
+    pipeline += [
+        wds.tarfile_to_samples(handler=wds.ignore_and_continue),
+        # sample shuffle BEFORE decode: bytes 수준에서 섞기 (torch 텐서 단계보다 RAM 부담 적음)
+        wds.shuffle(sample_shuffle),
+        wds.decode(wds.numpy_loads, wds.json_loads),
+        wds.map(decode_sample),  # 여기서 torch로 변환
+        wds.flatmap(lambda ex: maybe_split_long_to_base(ex, base_seconds=base_seconds, split_prob=split_long_prob)),
+        # split 이후 작은 shuffle(연속 chunk 완화)
+        wds.shuffle(post_split_shuffle),
+        wds.map(_prep),
+    ]
+
+    ds = wds.DataPipeline(*pipeline)
 
     if limit_num_samples and limit_num_samples > 0:
         ds = ds.take(limit_num_samples)

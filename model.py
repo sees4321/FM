@@ -71,10 +71,20 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
 # Spatial embedding: coords -> Fourier features
 # ============================================================
 class CoordFourierEmbedding(nn.Module):
-    def __init__(self, d_model: int, num_freqs: int, max_freq: float, include_raw: bool = True):
+    def __init__(self, 
+                 d_model: int, 
+                 num_freqs: int, 
+                 max_freq: float, 
+                 include_raw: bool = True,
+                 coord_jitter_std: float = 0.05,
+                 coord_jitter_prob: float = 0.5,
+                 renormalize: bool = False):
         super().__init__()
         self.num_freqs = int(num_freqs)
         self.include_raw = bool(include_raw)
+        self.coord_jitter_std = float(coord_jitter_std)
+        self.coord_jitter_prob = float(coord_jitter_prob)
+        self.renormalize = bool(renormalize)
 
         freqs = 2.0 ** torch.arange(self.num_freqs, dtype=torch.float32)
         freqs = freqs / freqs.max() * float(max_freq)
@@ -92,6 +102,11 @@ class CoordFourierEmbedding(nn.Module):
         return: (B, C, d_model)
         """
         B, C, _ = coords.shape
+        if self.training and (self.coord_jitter_std > 0) and (self.coord_jitter_prob > 0):
+            gate = (torch.rand((B,), device=coords.device) < self.coord_jitter_prob).to(coords.dtype)
+            coords = coords + torch.randn_like(coords) * self.coord_jitter_std * gate[:, None, None]
+            if self.renormalize:
+                coords = F.normalize(coords, p=2, dim=-1)
         ang = coords[..., None] * (self.freqs[None, None, None, :] * math.pi)  # (B,C,3,F)
         s = torch.sin(ang)
         c = torch.cos(ang)
@@ -463,8 +478,38 @@ class CrossAttentionRoPE(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, Lq, D)
         return self.out(out)
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, affine: bool = True):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim)) if affine else None
 
-class MLP(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., dim)
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        y = x * rms
+        if self.weight is not None:
+            y = y * self.weight
+        return y
+
+def make_norm(norm_type: str, dim: int, eps: float = 1e-6) -> nn.Module:
+    norm_type = norm_type.lower()
+    if norm_type in ("layernorm", "ln"):
+        return nn.LayerNorm(dim, eps=eps)
+    if norm_type in ("rmsnorm", "rms"):
+        return RMSNorm(dim, eps=eps, affine=True)
+    raise ValueError(f"Unknown norm_type: {norm_type}")
+
+class LayerScale(nn.Module):
+    def __init__(self, dim: int, init_value: float = 1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim) * init_value)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B,N,dim)
+        return x * self.gamma
+
+class MLP_GELU(nn.Module):
     def __init__(self, d_model: int, mlp_ratio: float, dropout: float):
         super().__init__()
         hidden = int(d_model * mlp_ratio)
@@ -480,11 +525,48 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class MLP_Gated(nn.Module):
+    """
+    GEGLU: GELU(a) * b
+    SwiGLU: SiLU(a) * b
+    set hidden scale to 2/3 to compare with GELU_MLP (similar #params)
+    """
+    def __init__(self, d_model: int, mlp_ratio: float, dropout: float, act: str = "swiglu", gate_scale: float = 2/3):
+        super().__init__()
+        act = act.lower()
+        assert act in ("geglu", "swiglu")
+        hidden = int(d_model * mlp_ratio * gate_scale)
+        self.fc = nn.Linear(d_model, 2 * hidden)
+        self.proj = nn.Linear(hidden, d_model)
+        self.drop = nn.Dropout(dropout)
+        self.act = act
+
+    def forward(self, x):
+        a, b = self.fc(x).chunk(2, dim=-1)
+        if self.act == "geglu":
+            x = F.gelu(a) * b
+        else:
+            x = F.silu(a) * b
+        x = self.drop(x)
+        x = self.proj(x)
+        x = self.drop(x)
+        return x
+
+def make_mlp(mlp_type: str, d_model: int, mlp_ratio: float, dropout: float) -> nn.Module:
+    mlp_type = mlp_type.lower()
+    if mlp_type in ("gelu", "mlp"):
+        return MLP_GELU(d_model, mlp_ratio, dropout)
+    if mlp_type in ("geglu",):
+        return MLP_Gated(d_model, mlp_ratio, dropout, act="geglu")
+    if mlp_type in ("swiglu",):
+        return MLP_Gated(d_model, mlp_ratio, dropout, act="swiglu")
+    raise ValueError(f"Unknown mlp_type: {mlp_type}")
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg: EEGModelConfig):
         super().__init__()
-        self.norm1 = nn.LayerNorm(cfg.d_model)
+        self.norm1 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
         self.attn = MultiheadSelfAttentionRoPE(
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
@@ -492,13 +574,26 @@ class TransformerBlock(nn.Module):
             rope_theta=cfg.rope_theta,
             rotary_pct=cfg.rotary_pct,
         )
-        self.norm2 = nn.LayerNorm(cfg.d_model)
-        self.mlp = MLP(cfg.d_model, cfg.mlp_ratio, cfg.dropout)
+        self.norm2 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
+        self.mlp = make_mlp(cfg.mlp_type, cfg.d_model, cfg.mlp_ratio, cfg.dropout)
         self.dropout = nn.Dropout(cfg.dropout)
 
+        if getattr(cfg, "layerscale_init", 0.0) and cfg.layerscale_init > 0:
+            self.ls1 = LayerScale(cfg.d_model, init_value=cfg.layerscale_init)
+            self.ls2 = LayerScale(cfg.d_model, init_value=cfg.layerscale_init)
+        else:
+            self.ls1 = None
+            self.ls2 = None
+
     def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor], rope_pos: torch.Tensor) -> torch.Tensor:
-        x = x + self.dropout(self.attn(self.norm1(x), padding_mask=padding_mask, rope_pos=rope_pos))
-        x = x + self.dropout(self.mlp(self.norm2(x)))
+        y = self.attn(self.norm1(x), padding_mask=padding_mask, rope_pos=rope_pos)
+        if self.ls1 is not None:
+            y = self.ls1(y)
+        x = x + self.dropout(y)
+        y = self.mlp(self.norm2(x))
+        if self.ls2 is not None:
+            y = self.ls2(y)
+        x = x + self.dropout(y)
         return x
 
 

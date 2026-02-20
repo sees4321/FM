@@ -20,7 +20,7 @@ from .masking import (
     dilate_time_mask,
 )
 from .augment import apply_student_augmentations
-from .data import find_shards, build_webdataset, AdaptiveTokenBucketBatcher
+from .data import find_shards, build_webdataset, ShapeBatcher, AdaptiveTokenBucketBatcher
 
 try:
     from accelerate import Accelerator
@@ -311,20 +311,39 @@ def main():
         hop_samples=hop_samples,
         enable_channel_grouping=train_cfg.enable_channel_grouping,
         limit_num_samples=train_cfg.limit_num_samples,
+        cache_max_bytes=train_cfg.cache_max_bytes,
+        post_split_shuffle=train_cfg.post_split_shuffle,
+        eviction_interval=train_cfg.eviction_interval,
     )
 
     # bucket batching
     bucket_bounds = train_cfg.bucket_bounds()
-    ds_batched = AdaptiveTokenBucketBatcher(
+    ds_batched = ShapeBatcher(
         dataset=ds,
-        boundaries=bucket_bounds,
         tokens_per_batch=train_cfg.tokens_per_batch,
         max_samples_per_batch=train_cfg.max_samples_per_batch,
         patch_samples=patch_samples,
         hop_samples=hop_samples,
-        allow_token_overshoot_ratio=train_cfg.allow_token_overshoot_ratio,
-        padded_tokens_per_batch=train_cfg.padded_tokens_per_batch,
+
+        # flush 정책(추천 시작값)
+        max_wait_samples=5000,          # 희귀 shape가 5000샘플 동안 배치 못 만들면 방출
+        flush_check_every=256,          # 256샘플마다 expired 검사
+        max_pending_samples=512,        # CPU 메모리 보호(중요!)
+        max_pending_tokens=0,           # 필요하면 활성화(예: 2_000_000)
+
+        shuffle_within_bucket=True,
+        yield_incomplete=True,
     )
+    # ds_batched = AdaptiveTokenBucketBatcher(
+    #     dataset=ds,
+    #     boundaries=bucket_bounds,
+    #     tokens_per_batch=train_cfg.tokens_per_batch,
+    #     max_samples_per_batch=train_cfg.max_samples_per_batch,
+    #     patch_samples=patch_samples,
+    #     hop_samples=hop_samples,
+    #     allow_token_overshoot_ratio=train_cfg.allow_token_overshoot_ratio,
+    #     padded_tokens_per_batch=train_cfg.padded_tokens_per_batch,
+    # )
 
     import webdataset as wds
     loader = wds.WebLoader(ds_batched, batch_size=None, num_workers=train_cfg.num_workers)
@@ -418,51 +437,52 @@ def main():
             c_ctx, t_ctx, pad_ctx = mask_to_packed_indices(context_mask, valid)
             c_tgt, t_tgt, pad_tgt = mask_to_packed_indices(target_mask, valid)
 
-            # 5) student: embed+encode context only
-            tok_ctx, pad_ctx, rope_ctx = accelerator.unwrap_model(student).embed_from_indices(
-                x=x_aug,
-                coords=coords.to(x.device),
-                c_idx=c_ctx,
-                t_idx=t_ctx,
-                pad=pad_ctx,
-                freq_mask_bins=freq_mask_bins,
-                freq_domain_drop=freq_domain_drop,
-            )
-            # NOTE: embed_from_indices called on unwrap_model(student) to avoid DDP wrapper issues with .unfold()
-            # Then we pass tokens through the wrapped model for proper distributed behavior.
-            z_ctx = student(tok_ctx, padding_mask=pad_ctx, rope_pos=rope_ctx)  # (B,Lc,D)
-
-            # 6) teacher: embed+encode targets only (no corruption)
-            with torch.no_grad():
-                tok_tgt, pad_tgt2, rope_tgt = accelerator.unwrap_model(teacher).embed_from_indices(
-                    x=x,
+            with accelerator.autocast():
+                # 5) student: embed+encode context only
+                tok_ctx, pad_ctx, rope_ctx = accelerator.unwrap_model(student).embed_from_indices(
+                    x=x_aug,
                     coords=coords.to(x.device),
-                    c_idx=c_tgt,
-                    t_idx=t_tgt,
-                    pad=pad_tgt,
-                    freq_mask_bins=None,
-                    freq_domain_drop=None,
+                    c_idx=c_ctx,
+                    t_idx=t_ctx,
+                    pad=pad_ctx,
+                    freq_mask_bins=freq_mask_bins,
+                    freq_domain_drop=freq_domain_drop,
                 )
-                z_tgt = teacher(tok_tgt, padding_mask=pad_tgt2, rope_pos=rope_tgt)  # (B,Lt,D)
+                # NOTE: embed_from_indices called on unwrap_model(student) to avoid DDP wrapper issues with .unfold()
+                # Then we pass tokens through the wrapped model for proper distributed behavior.
+                z_ctx = student(tok_ctx, padding_mask=pad_ctx, rope_pos=rope_ctx)  # (B,Lc,D)
 
-            # 7) predictor: build target queries from coord embeddings + cross-attend to ctx
-            coord_ch = accelerator.unwrap_model(student).coord_embed(coords.to(x.device))  # (B,C,D)
-            coord_tgt = gather_channel_embeddings(coord_ch, c_tgt.clamp(min=0), pad_tgt)   # (B,Lt,D)
+                # 6) teacher: embed+encode targets only (no corruption)
+                with torch.no_grad():
+                    tok_tgt, pad_tgt2, rope_tgt = accelerator.unwrap_model(teacher).embed_from_indices(
+                        x=x,
+                        coords=coords.to(x.device),
+                        c_idx=c_tgt,
+                        t_idx=t_tgt,
+                        pad=pad_tgt,
+                        freq_mask_bins=None,
+                        freq_domain_drop=None,
+                    )
+                    z_tgt = teacher(tok_tgt, padding_mask=pad_tgt2, rope_pos=rope_tgt)  # (B,Lt,D)
 
-            pred_tgt = predictor(
-                ctx=z_ctx,
-                ctx_pad=pad_ctx,
-                rope_ctx=rope_ctx,
-                tgt_coord_emb=coord_tgt,
-                tgt_pad=pad_tgt,
-                rope_tgt=rope_tgt,
-            )  # (B,Lt,D)
+                # 7) predictor: build target queries from coord embeddings + cross-attend to ctx
+                coord_ch = accelerator.unwrap_model(student).coord_embed(coords.to(x.device))  # (B,C,D)
+                coord_tgt = gather_channel_embeddings(coord_ch, c_tgt.clamp(min=0), pad_tgt)   # (B,Lt,D)
 
-            # 8) loss on non-pad targets
-            valid_tgt = ~pad_tgt
-            loss = F.l1_loss(pred_tgt[valid_tgt], z_tgt[valid_tgt], reduction="mean")
+                pred_tgt = predictor(
+                    ctx=z_ctx,
+                    ctx_pad=pad_ctx,
+                    rope_ctx=rope_ctx,
+                    tgt_coord_emb=coord_tgt,
+                    tgt_pad=pad_tgt,
+                    rope_tgt=rope_tgt,
+                )  # (B,Lt,D)
 
-            accelerator.backward(loss)
+                # 8) loss on non-pad targets
+                valid_tgt = ~pad_tgt
+                loss = F.l1_loss(pred_tgt[valid_tgt], z_tgt[valid_tgt], reduction="mean")
+
+            accelerator.backward(loss) # end autocast
 
             if accelerator.sync_gradients:
                 if train_cfg.grad_clip and train_cfg.grad_clip > 0:
@@ -497,10 +517,10 @@ def main():
                 if accelerator.is_main_process and (global_step % train_cfg.save_every == 0):
                     ckpt_dir = os.path.join(train_cfg.output_dir, f"step_{global_step:07d}")
                     os.makedirs(ckpt_dir, exist_ok=True)
-                    accelerator.unwrap_model(student).save_pretrained(os.path.join(ckpt_dir, "student"))
-                    torch.save(accelerator.unwrap_model(predictor).state_dict(), os.path.join(ckpt_dir, "predictor.pt"))
-                    accelerator.unwrap_model(teacher).save_pretrained(os.path.join(ckpt_dir, "teacher"))
-                    accelerator.save_state(os.path.join(ckpt_dir, "accelerator_state.pt"))
+                    accelerator.unwrap_model(student).save_pretrained(os.path.join(ckpt_dir, f"student_{global_step:07d}"))
+                    torch.save(accelerator.unwrap_model(predictor).state_dict(), os.path.join(ckpt_dir, f"predictor_{global_step:07d}.pt"))
+                    accelerator.unwrap_model(teacher).save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step:07d}"))
+                    accelerator.save_state(os.path.join(ckpt_dir, f"accelerator_state_{global_step:07d}.pt"))
 
                 global_step += 1
                 pbar.update(1)

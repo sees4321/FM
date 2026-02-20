@@ -16,6 +16,11 @@ class EEGModelConfig:
     patch_hop_seconds: float = 1.0  # hop < patch_seconds => overlap
     max_tokens: int = 4096
 
+    # --------- Model options ----------
+    mlp_type: str = "gelu"  # "gelu", "swiglu", or "geglu"
+    norm_type: str = "rmsnorm"  # "layernorm" or "rmsnorm"
+    layerscale_init: float = 0.0  # if >0, use LayerScale with this init value; else disable (typically starts with 1e-5; deeper models may need smaller)
+
     # --------- Model size ----------
     d_model: int = 512
     n_heads: int = 8
@@ -74,12 +79,15 @@ class EEGModelConfig:
 @dataclass
 class TrainConfig:
     # --------- Data ----------
-    data_root: str = "/mnt/hdd/open_eeg"
-    cache_dir: str = "/mnt/ssd/wds_cache"
+    data_root: str = "/mnt/e/open_eeg"
+    cache_dir: str = "/mnt/c/wds_cache"
     shard_glob: str = "**/*.tar"
 
-    shard_shuffle: int = 100
-    sample_shuffle: int = 2000
+    shard_shuffle: int = 500
+    sample_shuffle: int = 256 # sample_shuffle 너무 크게 잡지 말기(예: 256~1024부터)
+    cache_max_bytes: int = int(170*1024**3) # ex: 500GB -> 500*1024**3
+    post_split_shuffle: int = 128
+    eviction_interval: int = 8
 
     base_seconds: int = 10
     split_long_prob: float = 0.5
@@ -101,7 +109,7 @@ class TrainConfig:
     auto_tune_probe_seq_len: int = 4096  # worst-case per-sample tokens (<= model_cfg.max_tokens)
     auto_tune_probe_batch: int = 2
 
-    num_workers: int = 8
+    num_workers: int = 8 # num_workers는 2GPU 기준 4~6부터 시작(8은 RAM 여유 있을 때)
 
     # --------- JEPA masking ----------
     mask_time_prob: float = 0.8
@@ -128,6 +136,10 @@ class TrainConfig:
     freq_num_bands_max: int = 2
     freq_random_width_min: float = 0.10
     freq_random_width_max: float = 0.25
+
+    # --------- Channel coordinate corruption (student only) ----------
+    coord_jitter_std: float = 0.05           # applied with prob coord_jitter_prob
+    coord_jitter_prob: float = 0.5
 
     # --------- Optimization ----------
     lr: float = 2e-4
