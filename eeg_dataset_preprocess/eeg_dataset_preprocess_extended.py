@@ -19,14 +19,14 @@ CONFIG = {
     # --------------------------------------------------------------------------
     # [NEW] 파일 형식 및 데이터 소스 설정
     # --------------------------------------------------------------------------
-    "ROOT_DIR": "D:/open_eeg/ds001787",           # 데이터가 있는 최상위 폴더
-    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds001787/eeg-%06d.tar", # 결과 파일 패턴
+    "ROOT_DIR": "D:/open_eeg/ds003825",           # 데이터가 있는 최상위 폴더
+    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds003825/eeg-%06d.tar", # 결과 파일 패턴
 
-    # "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
-    "montage": "biosemi64", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    # "montage": "biosemi64", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     
     # 처리할 파일 확장자 (".edf", ".set", ".mat", ".tsv", ".csv", ".txt", ".bdf", ".vhdr" 등)
-    "FILE_EXT": "*.bdf", 
+    "FILE_EXT": "*.vhdr", 
 
     # [중요] EDF가 아닌 파일(MAT, TSV)을 위한 강제 설정
     # EDF 파일은 아래 두 설정이 무시됩니다 (파일 헤더 정보 사용).
@@ -184,21 +184,52 @@ class SmartEEGPreprocessor:
 
     def detect_line_noise(self, eeg_data, fs):
         try:
+            # 1. 샘플링 레이트가 너무 낮아 60Hz를 제대로 관측할 수 없는 경우 방어
+            if fs <= 120: 
+                return None 
+
             freqs, psd = signal.welch(eeg_data, fs, nperseg=int(fs), axis=-1)
             mean_psd = np.mean(psd, axis=0)
             
+            # 2. 타겟 주파수(50Hz, 60Hz) 인덱스 및 파워 추출
             idx_50 = np.argmin(np.abs(freqs - 50))
             idx_60 = np.argmin(np.abs(freqs - 60))
             
-            if idx_50 >= len(mean_psd) or idx_60 >= len(mean_psd): return None
+            if idx_50 >= len(mean_psd) or idx_60 >= len(mean_psd): 
+                return None
 
             power_50 = mean_psd[idx_50]
             power_60 = mean_psd[idx_60]
 
-            if power_60 > power_50 * 1.5: return 60.0
-            elif power_50 > power_60 * 1.5: return 50.0
+            # 3. 주변 주파수(Local Baseline) 대역 인덱스 설정 (±5Hz 구간)
+            idx_45 = np.argmin(np.abs(freqs - 45))
+            idx_55 = np.argmin(np.abs(freqs - 55))
+            idx_65 = np.argmin(np.abs(freqs - 65))
+
+            # np.median을 사용하면 정중앙의 노이즈 피크 값이 중간값에 영향을 주지 않음
+            baseline_50 = np.median(mean_psd[idx_45:idx_55])
+            baseline_60 = np.median(mean_psd[idx_55:idx_65])
+
+            # 4. 주변 베이스라인 대비 몇 배나 솟아올라야 노이즈로 볼 것인지 (Threshold)
+            # 선형 스케일(PSD) 기준 보통 4.0 ~ 5.0 배 이상 튀면 명확한 라인 노이즈로 간주
+            threshold = 5.0 
+            
+            is_50_noise = power_50 > (baseline_50 * threshold)
+            is_60_noise = power_60 > (baseline_60 * threshold)
+
+            # 5. 결과 반환
+            if is_60_noise and not is_50_noise:
+                return 60.0
+            elif is_50_noise and not is_60_noise:
+                return 50.0
+            elif is_50_noise and is_60_noise:
+                # 만약 둘 다 노이즈 기준을 넘었다면, 주변 대비 더 심하게 튀어오른 쪽을 반환
+                ratio_50 = power_50 / (baseline_50 + 1e-12) # 0 나누기 방지
+                ratio_60 = power_60 / (baseline_60 + 1e-12)
+                return 60.0 if ratio_60 > ratio_50 else 50.0
             return None
-        except:
+
+        except Exception:
             return None
 
     def apply(self, eeg_data, original_sr):
@@ -368,8 +399,8 @@ def process_single_file(file_path):
             clip_limit=CONFIG["CLIP_LIMIT"]
         )
         
-        # processed_full = preprocessor.apply(data[:,200*5:], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
-        processed_full = preprocessor.apply(data, sfreq)
+        processed_full = preprocessor.apply(data[:,1000*10:], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
+        # processed_full = preprocessor.apply(data, sfreq)
 
 
         # 세그멘테이션
