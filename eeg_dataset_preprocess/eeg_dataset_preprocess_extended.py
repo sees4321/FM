@@ -19,14 +19,14 @@ CONFIG = {
     # --------------------------------------------------------------------------
     # [NEW] 파일 형식 및 데이터 소스 설정
     # --------------------------------------------------------------------------
-    "ROOT_DIR": "D:/open_eeg/ds005506",           # 데이터가 있는 최상위 폴더
-    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds005506/eeg-%06d.tar", # 결과 파일 패턴
+    "ROOT_DIR": "D:/open_eeg/ds001787",           # 데이터가 있는 최상위 폴더
+    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds001787/eeg-%06d.tar", # 결과 파일 패턴
 
-    "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
-    # "montage": "biosemi256", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    # "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    "montage": "biosemi64", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     
     # 처리할 파일 확장자 (".edf", ".set", ".mat", ".tsv", ".csv", ".txt", ".bdf", ".vhdr" 등)
-    "FILE_EXT": "*.set", 
+    "FILE_EXT": "*.bdf", 
 
     # [중요] EDF가 아닌 파일(MAT, TSV)을 위한 강제 설정
     # EDF 파일은 아래 두 설정이 무시됩니다 (파일 헤더 정보 사용).
@@ -277,6 +277,22 @@ def clean_channel_names(raw):
         pass # 이름 변경 실패 시 경고 없이 넘어감 (좌표 매핑에서 걸러짐)
     return raw
 
+def biosemi64_mapping():
+    biosemi64_mapping = {
+        # Left hemisphere & Midline (A bundle)
+        'A1': 'Fp1', 'A2': 'AF7', 'A3': 'AF3', 'A4': 'F1', 'A5': 'F3', 'A6': 'F5', 'A7': 'F7', 'A8': 'FT7',
+        'A9': 'FC5', 'A10': 'FC3', 'A11': 'FC1', 'A12': 'C1', 'A13': 'C3', 'A14': 'C5', 'A15': 'T7', 'A16': 'TP7',
+        'A17': 'CP5', 'A18': 'CP3', 'A19': 'CP1', 'A20': 'P1', 'A21': 'P3', 'A22': 'P5', 'A23': 'P7', 'A24': 'P9',
+        'A25': 'PO7', 'A26': 'PO3', 'A27': 'O1', 'A28': 'Iz', 'A29': 'Oz', 'A30': 'POz', 'A31': 'Pz', 'A32': 'CPz',
+        
+        # Right hemisphere & Midline (B bundle)
+        'B1': 'Fpz', 'B2': 'Fp2', 'B3': 'AF8', 'B4': 'AF4', 'B5': 'AFz', 'B6': 'Fz', 'B7': 'F2', 'B8': 'F4',
+        'B9': 'F6', 'B10': 'F8', 'B11': 'FT8', 'B12': 'FC6', 'B13': 'FC4', 'B14': 'FC2', 'B15': 'FCz', 'B16': 'Cz',
+        'B17': 'C2', 'B18': 'C4', 'B19': 'C6', 'B20': 'T8', 'B21': 'TP8', 'B22': 'CP6', 'B23': 'CP4', 'B24': 'CP2',
+        'B25': 'P2', 'B26': 'P4', 'B27': 'P6', 'B28': 'P8', 'B29': 'P10', 'B30': 'PO8', 'B31': 'PO4', 'B32': 'O2'
+    }
+    return biosemi64_mapping
+
 def get_valid_channel_indices(raw):
     valid_names = []
     valid_coords = []
@@ -316,6 +332,8 @@ def process_single_file(file_path):
         try:
         # 3. Standard-1005 몽타주 적용 (좌표 매핑의 핵심)
             montage = mne.channels.make_standard_montage(CONFIG["montage"])
+            if CONFIG["montage"] == 'biosemi64':
+                raw.rename_channels(biosemi64_mapping())
             raw.set_montage(montage, match_case=False, on_missing='ignore')
         except: pass
         
@@ -324,6 +342,7 @@ def process_single_file(file_path):
             try:
                 raw.pick("eeg", exclude="bads")
             except ValueError: pass
+
 
         if len(raw.ch_names) < 3: 
             print(f"[Skip] {file_path}: Not enough valid channels ({len(raw.ch_names)})")
