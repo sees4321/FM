@@ -19,8 +19,8 @@ CONFIG = {
     # --------------------------------------------------------------------------
     # [NEW] 파일 형식 및 데이터 소스 설정
     # --------------------------------------------------------------------------
-    "ROOT_DIR": "D:/open_eeg/ds003825",           # 데이터가 있는 최상위 폴더
-    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds003825/eeg-%06d.tar", # 결과 파일 패턴
+    "ROOT_DIR": "D:/open_eeg/ds004043",           # 데이터가 있는 최상위 폴더
+    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds004043/eeg-%06d.tar", # 결과 파일 패턴
 
     "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     # "montage": "biosemi64", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
@@ -399,7 +399,7 @@ def process_single_file(file_path):
             clip_limit=CONFIG["CLIP_LIMIT"]
         )
         
-        processed_full = preprocessor.apply(data[:,1000*10:], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
+        processed_full = preprocessor.apply(data[:,sfreq*10:-sfreq*10], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
         # processed_full = preprocessor.apply(data, sfreq)
 
 
