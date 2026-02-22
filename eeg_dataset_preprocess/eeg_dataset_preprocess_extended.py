@@ -399,7 +399,7 @@ def process_single_file(file_path):
             clip_limit=CONFIG["CLIP_LIMIT"]
         )
         
-        processed_full = preprocessor.apply(data[:,sfreq*10:-sfreq*10], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
+        processed_full = preprocessor.apply(data[:,int(sfreq*10):-int(sfreq*10)], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
         # processed_full = preprocessor.apply(data, sfreq)
 
 
