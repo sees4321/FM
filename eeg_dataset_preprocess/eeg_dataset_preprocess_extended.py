@@ -19,8 +19,8 @@ CONFIG = {
     # --------------------------------------------------------------------------
     # [NEW] 파일 형식 및 데이터 소스 설정
     # --------------------------------------------------------------------------
-    "ROOT_DIR": "D:/open_eeg/ds004043",           # 데이터가 있는 최상위 폴더
-    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds004043/eeg-%06d.tar", # 결과 파일 패턴
+    "ROOT_DIR": "D:/open_eeg/ds004572",           # 데이터가 있는 최상위 폴더
+    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds004572/eeg-%06d.tar", # 결과 파일 패턴
 
     "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     # "montage": "biosemi64", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
@@ -52,6 +52,7 @@ CONFIG = {
     "TARGET_SR": 200,        # 목표 샘플링 레이트
     "BANDPASS": (0.5, 75.0), # (Low cut, High cut)
     "NOTCH_Q": 30.0,         # Notch Filter Q factor
+    "NOTCH_FREQ": 50.0,      # None이면 자동 감지
     "CLIP_LIMIT": 15.0,      # Z-score 후 클리핑
 
     # 세그멘테이션 설정
@@ -244,7 +245,7 @@ class SmartEEGPreprocessor:
             adjusted_high = high_cut
 
         # Notch Filter
-        line_freq = self.detect_line_noise(eeg_data, original_sr)
+        line_freq = CONFIG["NOTCH_FREQ"] if CONFIG["NOTCH_FREQ"] is not None else self.detect_line_noise(eeg_data, original_sr)
         if line_freq and line_freq < nyq:
             b_notch, a_notch = signal.iirnotch(line_freq, Q=CONFIG["NOTCH_Q"], fs=original_sr)
             eeg_data = signal.filtfilt(b_notch, a_notch, eeg_data, axis=-1)
@@ -399,8 +400,8 @@ def process_single_file(file_path):
             clip_limit=CONFIG["CLIP_LIMIT"]
         )
         
-        processed_full = preprocessor.apply(data[:,int(sfreq*10):-int(sfreq*10)], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
-        # processed_full = preprocessor.apply(data, sfreq)
+        # processed_full = preprocessor.apply(data[:,int(sfreq*20):-int(sfreq*20)], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
+        processed_full = preprocessor.apply(data, sfreq)
 
 
         # 세그멘테이션
