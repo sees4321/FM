@@ -194,7 +194,7 @@ class RFFTFreqFeatures(nn.Module):
         self.register_buffer("fb", fb, persistent=False)
         self.register_buffer("bin_centers_hz", centers, persistent=False)
 
-        self.ln = nn.LayerNorm(cfg.freq_bins)
+        self.ln = make_norm(cfg.norm_type, cfg.freq_bins, eps=1e-6)
         self.freq_dim = cfg.freq_bins + (1 if cfg.freq_use_scale else 0)
 
     def forward_packed(self, patches: torch.Tensor) -> torch.Tensor:
@@ -366,7 +366,7 @@ class MultiheadSelfAttentionRoPE(nn.Module):
 
         attn_mask = None
         if padding_mask is not None:
-            attn_mask = padding_mask[:, None, None, :]  # (B,1,1,N)
+            attn_mask = (~padding_mask)[:, None, None, :]  # (B,1,1,N)
 
         out = F.scaled_dot_product_attention(
             q, k, v,
@@ -466,7 +466,7 @@ class CrossAttentionRoPE(nn.Module):
 
         attn_mask = None
         if kv_padding_mask is not None:
-            attn_mask = kv_padding_mask[:, None, None, :]  # (B,1,1,Lk)
+            attn_mask = (~kv_padding_mask)[:, None, None, :]  # (B,1,1,Lk)
 
         out = F.scaled_dot_product_attention(
             q, k, v,
@@ -622,6 +622,9 @@ class EEGEncoder(nn.Module):
             num_freqs=cfg.coord_num_freqs,
             max_freq=cfg.coord_max_freq,
             include_raw=cfg.coord_include_raw,
+            coord_jitter_std=cfg.coord_jitter_std,
+            coord_jitter_prob=cfg.coord_jitter_prob,
+            renormalize=cfg.coord_renormalize,
         )
         self.film = FiLMFusion(
             freq_dim=self.freq_feat.freq_dim,
@@ -630,7 +633,7 @@ class EEGEncoder(nn.Module):
         )
 
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
-        self.norm = nn.LayerNorm(cfg.d_model)
+        self.norm = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
 
     def extract_patches_view(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -749,17 +752,16 @@ class EEGEncoder(nn.Module):
 
 class PredictorMLP(nn.Module):
     """
-    Optional: simple per-token MLP predictor.
     (Kept for ablations / debugging.)
     """
-    def __init__(self, d_model: int, hidden: int, depth: int, dropout: float):
+    def __init__(self, d_model: int, hidden: int, depth: int, dropout: float, norm_type: str):
         super().__init__()
         layers = []
         in_dim = d_model
         for _ in range(max(1, depth - 1)):
-            layers += [nn.LayerNorm(in_dim), nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(dropout)]
+            layers += [make_norm(norm_type, in_dim, eps=1e-6), nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(dropout)]
             in_dim = hidden
-        layers += [nn.LayerNorm(in_dim), nn.Linear(in_dim, d_model)]
+        layers += [make_norm(norm_type, in_dim, eps=1e-6), nn.Linear(in_dim, d_model)]
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -767,10 +769,17 @@ class PredictorMLP(nn.Module):
 
 
 class CrossAttnPredictorBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float, dropout: float, attn_dropout: float,
-                 rope_theta: float, rotary_pct: float):
+    def __init__(self, cfg: EEGModelConfig):
         super().__init__()
-        self.norm_q = nn.LayerNorm(d_model)
+        d_model = cfg.d_model
+        n_heads = getattr(cfg, "predictor_n_heads", cfg.n_heads)
+        mlp_ratio = getattr(cfg, "predictor_mlp_ratio", cfg.mlp_ratio)
+        dropout = cfg.dropout
+        attn_dropout = cfg.attn_dropout
+        rope_theta = cfg.rope_theta
+        rotary_pct = cfg.rotary_pct
+
+        self.norm1 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
         self.xattn = CrossAttentionRoPE(
             d_model=d_model,
             n_heads=n_heads,
@@ -779,11 +788,11 @@ class CrossAttnPredictorBlock(nn.Module):
             rotary_pct=rotary_pct,
         )
         self.drop = nn.Dropout(dropout)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.mlp = MLP(d_model, mlp_ratio=mlp_ratio, dropout=dropout)
+        self.norm2 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
+        self.mlp = make_mlp(cfg.mlp_type, d_model, mlp_ratio=mlp_ratio, dropout=dropout)
 
     def forward(self, q: torch.Tensor, ctx: torch.Tensor, ctx_pad: torch.Tensor, rope_q: torch.Tensor, rope_ctx: torch.Tensor) -> torch.Tensor:
-        q = q + self.drop(self.xattn(self.norm_q(q), ctx, ctx_pad, rope_pos_q=rope_q, rope_pos_k=rope_ctx))
+        q = q + self.drop(self.xattn(self.norm1(q), ctx, ctx_pad, rope_pos_q=rope_q, rope_pos_k=rope_ctx))
         q = q + self.drop(self.mlp(self.norm2(q)))
         return q
 
@@ -797,26 +806,13 @@ class CrossAttentionPredictor(nn.Module):
     def __init__(self, cfg: EEGModelConfig):
         super().__init__()
         d_model = cfg.d_model
-        n_heads = getattr(cfg, "predictor_n_heads", cfg.n_heads)
         depth = getattr(cfg, "predictor_layers", 2)
-        mlp_ratio = getattr(cfg, "predictor_mlp_ratio", cfg.mlp_ratio)
 
         self.query_token = nn.Parameter(torch.zeros(d_model))
         nn.init.normal_(self.query_token, std=0.02)
 
-        self.blocks = nn.ModuleList([
-            CrossAttnPredictorBlock(
-                d_model=d_model,
-                n_heads=n_heads,
-                mlp_ratio=mlp_ratio,
-                dropout=cfg.dropout,
-                attn_dropout=cfg.attn_dropout,
-                rope_theta=cfg.rope_theta,
-                rotary_pct=cfg.rotary_pct,
-            )
-            for _ in range(depth)
-        ])
-        self.norm = nn.LayerNorm(d_model)
+        self.blocks = nn.ModuleList([CrossAttnPredictorBlock(cfg) for _ in range(depth)])
+        self.norm = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
 
     def forward(
         self,

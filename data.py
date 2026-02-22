@@ -8,7 +8,6 @@ import numpy as np
 import os
 import random
 import shutil
-import time
 import torch
 
 from contextlib import contextmanager
@@ -42,22 +41,6 @@ def find_shards(data_root: str, shard_glob: str) -> List[str]:
     pat = os.path.join(data_root, shard_glob)
     shards = sorted(glob.glob(pat, recursive=True))
     return shards
-
-
-def cache_shard_to_ssd(shard_path: str, cache_dir: str) -> str:
-    """
-    단순 캐시: shard를 SSD cache_dir로 복사 후 그 경로를 반환.
-    - NEW(C)와는 별개: 여기 캐시는 'file이 없으면 복사' 수준.
-    - 실제 SSD 용량 관리(LRU 등)는 이후 확장 권장.
-    """
-    os.makedirs(cache_dir, exist_ok=True)
-    base = os.path.basename(shard_path)
-    cached = os.path.join(cache_dir, base)
-    if not os.path.exists(cached):
-        tmp = cached + ".tmp"
-        shutil.copyfile(shard_path, tmp)
-        os.replace(tmp, cached)
-    return cached
 
 
 def _as_torch(x: Any) -> torch.Tensor:
@@ -134,20 +117,6 @@ def maybe_split_long_to_base(
         out["meta"]["parent_duration_sec"] = duration_sec
         outs.append(out)
     return outs if len(outs) > 0 else [ex]
-
-
-@torch.no_grad()
-def farthest_point_grouping(coords: torch.Tensor, K: int) -> torch.Tensor:
-    C = coords.shape[0]
-    dmat = torch.cdist(coords, coords, p=2)
-    chosen = torch.zeros((K,), dtype=torch.long)
-    chosen[0] = 0
-    min_dist = dmat[0].clone()
-    for i in range(1, K):
-        idx = torch.argmax(min_dist).item()
-        chosen[i] = idx
-        min_dist = torch.minimum(min_dist, dmat[idx])
-    return chosen
 
 
 def maybe_group_channels(
@@ -339,21 +308,31 @@ class LRUShardCache:
 
         if not os.path.exists(cached):
             tmp = cached + f".tmp.{os.getpid()}"
+            copied = False
             try:
-                shutil.copyfile(shard_path, tmp)
-                # atomic replace
-                os.replace(tmp, cached)
-            except FileExistsError:
-                pass
+                try:
+                    shutil.copyfile(shard_path, tmp)
+                    os.replace(tmp, cached)
+                    copied = True
+                except OSError as e:
+                    # No space left on device -> eviction retry
+                    if self.enable_eviction and getattr(e, "errno", None) == 28:
+                        self.evict_if_needed()
+                        shutil.copyfile(shard_path, tmp)
+                        os.replace(tmp, cached)
+                        copied = True
             except Exception:
-                # 다른 프로세스가 먼저 만들어놓은 경우 등: tmp 정리 후 진행
-                pass
+                copied = False
             finally:
                 try:
                     if os.path.exists(tmp):
                         os.remove(tmp)
                 except Exception:
                     pass
+
+            # if copy failed, return original path (fallback)
+            if not copied or not os.path.exists(cached):
+                return shard_path
 
         # touch: LRU 위해 mtime 갱신
         try:
@@ -699,13 +678,12 @@ def build_webdataset(
     # on-demand LRU cache
     cache = None
     if cache_dir and cache_max_bytes > 0:
-        # eviction은 LOCAL_RANK==0만 하게 하면 thrash가 줄어듦(선택)
-        enable_evict = (int(os.environ.get("LOCAL_RANK", "0")) == 0)
+        # enable_evict = (int(os.environ.get("LOCAL_RANK", "0")) == 0)
         cache = LRUShardCache(
             cache_dir=cache_dir,
             max_bytes=cache_max_bytes,
             eviction_interval=eviction_interval,
-            enable_eviction=enable_evict,
+            enable_eviction=True,
         )
 
     def _prep(ex):

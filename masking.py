@@ -115,25 +115,6 @@ def sample_jepa_target_mask(
 
 
 @torch.no_grad()
-def apply_patch_signal_mask(
-    x: torch.Tensor,           # (B, C, T)
-    target_mask: torch.Tensor, # (B, C, P_t)
-    patch_samples: int,
-) -> torch.Tensor:
-    B, C, T = x.shape
-    P_t = target_mask.shape[-1]
-    T_need = P_t * patch_samples
-    if T < T_need:
-        pad = T_need - T
-        x = torch.nn.functional.pad(x, (0, pad))
-        T = x.shape[-1]
-    x = x[:, :, :T_need]
-    xp = x.view(B, C, P_t, patch_samples).clone()
-    xp[target_mask] = 0.0
-    return xp.view(B, C, T_need)
-
-
-@torch.no_grad()
 def physio_band_bin_masks(bin_centers_hz: torch.Tensor) -> Dict[str, torch.Tensor]:
     def m(lo, hi):
         return (bin_centers_hz >= lo) & (bin_centers_hz < hi)

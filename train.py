@@ -20,7 +20,7 @@ from .masking import (
     dilate_time_mask,
 )
 from .augment import apply_student_augmentations
-from .data import find_shards, build_webdataset, ShapeBatcher, AdaptiveTokenBucketBatcher
+from .data import find_shards, build_webdataset, ShapeBatcher #, AdaptiveTokenBucketBatcher
 
 try:
     from accelerate import Accelerator
@@ -317,7 +317,6 @@ def main():
     )
 
     # bucket batching
-    bucket_bounds = train_cfg.bucket_bounds()
     ds_batched = ShapeBatcher(
         dataset=ds,
         tokens_per_batch=train_cfg.tokens_per_batch,
@@ -334,6 +333,7 @@ def main():
         shuffle_within_bucket=True,
         yield_incomplete=True,
     )
+    # bucket_bounds = train_cfg.bucket_bounds()
     # ds_batched = AdaptiveTokenBucketBatcher(
     #     dataset=ds,
     #     boundaries=bucket_bounds,
@@ -515,12 +515,13 @@ def main():
                     accelerator.log(logs, step=global_step)
 
                 if accelerator.is_main_process and (global_step % train_cfg.save_every == 0):
+                    accelerator.wait_for_everyone()
                     ckpt_dir = os.path.join(train_cfg.output_dir, f"step_{global_step:07d}")
                     os.makedirs(ckpt_dir, exist_ok=True)
                     accelerator.unwrap_model(student).save_pretrained(os.path.join(ckpt_dir, f"student_{global_step:07d}"))
                     torch.save(accelerator.unwrap_model(predictor).state_dict(), os.path.join(ckpt_dir, f"predictor_{global_step:07d}.pt"))
                     accelerator.unwrap_model(teacher).save_pretrained(os.path.join(ckpt_dir, f"teacher_{global_step:07d}"))
-                    accelerator.save_state(os.path.join(ckpt_dir, f"accelerator_state_{global_step:07d}.pt"))
+                    accelerator.save_state(os.path.join(ckpt_dir, f"accelerator_state_{global_step:07d}"))
 
                 global_step += 1
                 pbar.update(1)
@@ -529,12 +530,13 @@ def main():
     pbar.close()
 
     if accelerator.is_main_process:
+        accelerator.wait_for_everyone()  # ensure all processes have finished saving before we write the final checkpoint
         final_dir = os.path.join(train_cfg.output_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
         accelerator.unwrap_model(student).save_pretrained(os.path.join(final_dir, "student"))
         torch.save(accelerator.unwrap_model(predictor).state_dict(), os.path.join(final_dir, "predictor.pt"))
         accelerator.unwrap_model(teacher).save_pretrained(os.path.join(final_dir, "teacher"))
-        accelerator.save_state(os.path.join(final_dir, "accelerator_state.pt"))
+        accelerator.save_state(os.path.join(final_dir, "accelerator_state"))
 
 if __name__ == "__main__":
     main()

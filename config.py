@@ -35,8 +35,11 @@ class EEGModelConfig:
 
     # --------- Spatial embedding ----------
     coord_num_freqs: int = 6
-    coord_max_freq: float = 16.0
+    coord_max_freq: float = 2.0
     coord_include_raw: bool = True
+    coord_jitter_std: float = 0.05           # applied with prob coord_jitter_prob
+    coord_jitter_prob: float = 0.5
+    coord_renormalize: bool = False           # renormalize coords to unit cube after jitter
 
     # --------- Frequency features ----------
     freq_min_hz: float = 0.5
@@ -95,15 +98,13 @@ class TrainConfig:
     enable_channel_grouping: bool = True
 
     # bucket batching
-    bucket_boundaries: str = "0,200,400,800,1200,2000,4096"
     tokens_per_batch: int = 16384           # target sum(valid_tokens) per microbatch
     max_samples_per_batch: int = 256
-    # NEW(C): overshoot 방지용 greedy packing (tokens_per_batch를 크게 초과하지 않게)
-    allow_token_overshoot_ratio: float = 1.10
-    # NEW(C): optional padded-token budget (batch_size * max_len). 0 disables.
-    padded_tokens_per_batch: int = 0
+    # bucket_boundaries: str = "0,200,400,800,1200,2000,4096"
+    # allow_token_overshoot_ratio: float = 1.10 # overshoot 방지용 greedy packing (tokens_per_batch를 크게 초과하지 않게)
+    # padded_tokens_per_batch: int = 0 # optional padded-token budget (batch_size * max_len). 0 disables.
 
-    # NEW(1): auto-tune tokens_per_batch with a synthetic probe (optional)
+    # auto-tune tokens_per_batch with a synthetic probe (optional)
     auto_tune_tokens_per_batch: bool = False
     auto_tune_target_mem_frac: float = 0.85
     auto_tune_probe_seq_len: int = 4096  # worst-case per-sample tokens (<= model_cfg.max_tokens)
@@ -136,10 +137,6 @@ class TrainConfig:
     freq_num_bands_max: int = 2
     freq_random_width_min: float = 0.10
     freq_random_width_max: float = 0.25
-
-    # --------- Channel coordinate corruption (student only) ----------
-    coord_jitter_std: float = 0.05           # applied with prob coord_jitter_prob
-    coord_jitter_prob: float = 0.5
 
     # --------- Optimization ----------
     lr: float = 2e-4
