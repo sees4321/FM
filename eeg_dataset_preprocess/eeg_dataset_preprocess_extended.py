@@ -19,14 +19,16 @@ CONFIG = {
     # --------------------------------------------------------------------------
     # [NEW] 파일 형식 및 데이터 소스 설정
     # --------------------------------------------------------------------------
-    "ROOT_DIR": "D:/open_eeg/ds004572",           # 데이터가 있는 최상위 폴더
-    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds004572/eeg-%06d.tar", # 결과 파일 패턴
+    # "ROOT_DIR": "D:/open_eeg/ds004572",           # 데이터가 있는 최상위 폴더
+    "ROOT_DIR": "D:\\start\\eeg_foundation_model\\datasets\\Inria Large\\Signals",
+    # "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds004572/eeg-%06d.tar", # 결과 파일 패턴
+    "OUTPUT_PATTERN": "D:\\start\\eeg_foundation_model\\zenodo_InriaLarge/eeg-%06d.tar", # 결과 파일 패턴
 
     "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     # "montage": "biosemi64", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     
-    # 처리할 파일 확장자 (".edf", ".set", ".mat", ".tsv", ".csv", ".txt", ".bdf", ".vhdr" 등)
-    "FILE_EXT": "*.vhdr", 
+    # 처리할 파일 확장자 (".edf", ".set", ".mat", ".tsv", ".csv", ".txt", ".bdf", ".vhdr", ".gdf" 등)
+    "FILE_EXT": "*.gdf", 
 
     # [중요] EDF가 아닌 파일(MAT, TSV)을 위한 강제 설정
     # EDF 파일은 아래 두 설정이 무시됩니다 (파일 헤더 정보 사용).
@@ -35,8 +37,9 @@ CONFIG = {
     # MAT/TSV 데이터의 채널 순서대로 이름 지정 (Standard-1005 몽타주 이름 권장)
     # 데이터의 열(Column) 또는 행(Row) 순서와 일치해야 합니다.
     "FORCE_CH_NAMES": [
-        "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "T3", "C3", "Cz", 
-        "C4", "T4", "T5", "P3", "Pz", "P4", "T6", "O1", "O2"
+        'Fz', 'FCz', 'Cz', 'CPz', 'Pz', 'C1', 'C3', 'C5', 'C2', 'C4', 'C6', 'F4',
+        'FC2', 'FC4', 'FC6', 'CP2', 'CP4', 'CP6', 'P4', 'F3', 'FC1', 'FC3', 'FC5',
+        'CP1', 'CP3', 'CP5', 'P3'
     ],
 
     # [MAT 파일 전용] 데이터가 들어있는 변수 키 (예: 'data', 'X', 'eeg_data')
@@ -56,7 +59,7 @@ CONFIG = {
     "CLIP_LIMIT": 15.0,      # Z-score 후 클리핑
 
     # 세그멘테이션 설정
-    "WINDOW_SECONDS": 60,    # 10초 단위로 자르기
+    "WINDOW_SECONDS": 10,    # 10초 단위로 자르기
     "DROP_LAST": True,       # 자투리 버림
 
     # 저장 설정
@@ -111,6 +114,13 @@ def load_data_to_mne(file_path):
                 raw = mne.io.read_raw_brainvision(file_path, preload=True, verbose=False)
             return raw
         
+        # [Case 1.8] GDF 파일 (.gdf) - 혜성 추가
+        elif ext == '.gdf':
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                raw = mne.io.read_raw_gdf(file_path, preload=True, verbose=False)
+            return raw
+        
         # [Case 2] MAT 파일
         elif ext == '.mat':
             mat = sio.loadmat(file_path)
@@ -129,6 +139,8 @@ def load_data_to_mne(file_path):
             header = 0 if CONFIG["HAS_HEADER"] else None
             df = pd.read_csv(file_path, sep=CONFIG["SEPARATOR"], header=header)
             data = df.values
+
+
 
         else:
             print(f"[Error] Unsupported extension: {ext}")
