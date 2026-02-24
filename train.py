@@ -97,6 +97,32 @@ def mask_to_packed_indices(mask: torch.Tensor, valid: torch.Tensor) -> Tuple[tor
     return c_idx, t_idx, pad
 
 
+@torch.no_grad()
+def rescale_small_segments(
+    x: torch.Tensor,            # (B,C,T) fp16/bf16/fp32
+    target_rms: float = 1.0,
+    rms_low: float = 0.5,
+    rms_floor: float = 0.05,
+    gain_max: float = 8.0,
+    clip: float = 15.0,
+) -> torch.Tensor:
+    # fp32에서 통계 계산(안정)
+    x32 = x.float()
+    rms = torch.sqrt(torch.mean(x32 * x32, dim=(1,2), keepdim=True) + 1e-8)  # (B,1,1)
+
+    # rms가 너무 작은 것만 보정
+    need = (rms < rms_low).to(x32.dtype)  # (B,1,1) 0/1
+    gain = (target_rms / rms.clamp_min(rms_floor)).clamp(1.0 / gain_max, gain_max)
+
+    # need==1인 샘플만 스케일 적용
+    x32 = x32 * (1.0 + need * (gain - 1.0))
+
+    if clip and clip > 0:
+        x32 = x32.clamp(-clip, clip)
+
+    return x32.to(dtype=x.dtype)
+
+
 def gather_channel_embeddings(x: torch.Tensor, c_idx: torch.Tensor, pad: torch.Tensor) -> torch.Tensor:
     """
     x: (B,C,D)
@@ -379,6 +405,7 @@ def main():
 
         x = batch["eeg"]          # (B,C,T)
         coords = batch["coord"]   # (B,C,3)
+        x = rescale_small_segments(x, target_rms=1.0, rms_low=-0.5, rms_floor=0.05, gain_max=8.0, clip=15.0)
         n_channels = batch["n_channels"].to(x.device)
         n_patches = batch["n_patches"].to(x.device)
         B, C_max, _ = x.shape
