@@ -19,16 +19,14 @@ CONFIG = {
     # --------------------------------------------------------------------------
     # [NEW] 파일 형식 및 데이터 소스 설정
     # --------------------------------------------------------------------------
-    # "ROOT_DIR": "D:/open_eeg/ds004572",           # 데이터가 있는 최상위 폴더
-    "ROOT_DIR": "D:\\start\\eeg_foundation_model\\datasets\\Inria Large\\Signals",
-    # "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds004572/eeg-%06d.tar", # 결과 파일 패턴
-    "OUTPUT_PATTERN": "D:\\start\\eeg_foundation_model\\zenodo_InriaLarge/eeg-%06d.tar", # 결과 파일 패턴
+    "ROOT_DIR": "D:/open_eeg/ds004395",           # 데이터가 있는 최상위 폴더
+    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds004395_2/eeg-%06d.tar", # 결과 파일 패턴
 
-    "montage": "standard_1005", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
-    # "montage": "biosemi64", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    "montage": "GSN-HydroCel-129", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    # "montage": "biosemi256", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     
-    # 처리할 파일 확장자 (".edf", ".set", ".mat", ".tsv", ".csv", ".txt", ".bdf", ".vhdr", ".gdf" 등)
-    "FILE_EXT": "*.gdf", 
+    # 처리할 파일 확장자 (".edf", ".set", ".mat", ".tsv", ".csv", ".txt", ".bdf", ".vhdr" 등)
+    "FILE_EXT": "*.edf", 
 
     # [중요] EDF가 아닌 파일(MAT, TSV)을 위한 강제 설정
     # EDF 파일은 아래 두 설정이 무시됩니다 (파일 헤더 정보 사용).
@@ -37,9 +35,8 @@ CONFIG = {
     # MAT/TSV 데이터의 채널 순서대로 이름 지정 (Standard-1005 몽타주 이름 권장)
     # 데이터의 열(Column) 또는 행(Row) 순서와 일치해야 합니다.
     "FORCE_CH_NAMES": [
-        'Fz', 'FCz', 'Cz', 'CPz', 'Pz', 'C1', 'C3', 'C5', 'C2', 'C4', 'C6', 'F4',
-        'FC2', 'FC4', 'FC6', 'CP2', 'CP4', 'CP6', 'P4', 'F3', 'FC1', 'FC3', 'FC5',
-        'CP1', 'CP3', 'CP5', 'P3'
+        "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8", "T3", "C3", "Cz", 
+        "C4", "T4", "T5", "P3", "Pz", "P4", "T6", "O1", "O2"
     ],
 
     # [MAT 파일 전용] 데이터가 들어있는 변수 키 (예: 'data', 'X', 'eeg_data')
@@ -55,11 +52,10 @@ CONFIG = {
     "TARGET_SR": 200,        # 목표 샘플링 레이트
     "BANDPASS": (0.5, 75.0), # (Low cut, High cut)
     "NOTCH_Q": 30.0,         # Notch Filter Q factor
-    "NOTCH_FREQ": 50.0,      # None이면 자동 감지
     "CLIP_LIMIT": 15.0,      # Z-score 후 클리핑
 
     # 세그멘테이션 설정
-    "WINDOW_SECONDS": 10,    # 10초 단위로 자르기
+    "WINDOW_SECONDS": 60,    # 10초 단위로 자르기
     "DROP_LAST": True,       # 자투리 버림
 
     # 저장 설정
@@ -114,13 +110,6 @@ def load_data_to_mne(file_path):
                 raw = mne.io.read_raw_brainvision(file_path, preload=True, verbose=False)
             return raw
         
-        # [Case 1.8] GDF 파일 (.gdf) - 혜성 추가
-        elif ext == '.gdf':
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                raw = mne.io.read_raw_gdf(file_path, preload=True, verbose=False)
-            return raw
-        
         # [Case 2] MAT 파일
         elif ext == '.mat':
             mat = sio.loadmat(file_path)
@@ -139,8 +128,6 @@ def load_data_to_mne(file_path):
             header = 0 if CONFIG["HAS_HEADER"] else None
             df = pd.read_csv(file_path, sep=CONFIG["SEPARATOR"], header=header)
             data = df.values
-
-
 
         else:
             print(f"[Error] Unsupported extension: {ext}")
@@ -197,52 +184,21 @@ class SmartEEGPreprocessor:
 
     def detect_line_noise(self, eeg_data, fs):
         try:
-            # 1. 샘플링 레이트가 너무 낮아 60Hz를 제대로 관측할 수 없는 경우 방어
-            if fs <= 120: 
-                return None 
-
             freqs, psd = signal.welch(eeg_data, fs, nperseg=int(fs), axis=-1)
             mean_psd = np.mean(psd, axis=0)
             
-            # 2. 타겟 주파수(50Hz, 60Hz) 인덱스 및 파워 추출
             idx_50 = np.argmin(np.abs(freqs - 50))
             idx_60 = np.argmin(np.abs(freqs - 60))
             
-            if idx_50 >= len(mean_psd) or idx_60 >= len(mean_psd): 
-                return None
+            if idx_50 >= len(mean_psd) or idx_60 >= len(mean_psd): return None
 
             power_50 = mean_psd[idx_50]
             power_60 = mean_psd[idx_60]
 
-            # 3. 주변 주파수(Local Baseline) 대역 인덱스 설정 (±5Hz 구간)
-            idx_45 = np.argmin(np.abs(freqs - 45))
-            idx_55 = np.argmin(np.abs(freqs - 55))
-            idx_65 = np.argmin(np.abs(freqs - 65))
-
-            # np.median을 사용하면 정중앙의 노이즈 피크 값이 중간값에 영향을 주지 않음
-            baseline_50 = np.median(mean_psd[idx_45:idx_55])
-            baseline_60 = np.median(mean_psd[idx_55:idx_65])
-
-            # 4. 주변 베이스라인 대비 몇 배나 솟아올라야 노이즈로 볼 것인지 (Threshold)
-            # 선형 스케일(PSD) 기준 보통 4.0 ~ 5.0 배 이상 튀면 명확한 라인 노이즈로 간주
-            threshold = 5.0 
-            
-            is_50_noise = power_50 > (baseline_50 * threshold)
-            is_60_noise = power_60 > (baseline_60 * threshold)
-
-            # 5. 결과 반환
-            if is_60_noise and not is_50_noise:
-                return 60.0
-            elif is_50_noise and not is_60_noise:
-                return 50.0
-            elif is_50_noise and is_60_noise:
-                # 만약 둘 다 노이즈 기준을 넘었다면, 주변 대비 더 심하게 튀어오른 쪽을 반환
-                ratio_50 = power_50 / (baseline_50 + 1e-12) # 0 나누기 방지
-                ratio_60 = power_60 / (baseline_60 + 1e-12)
-                return 60.0 if ratio_60 > ratio_50 else 50.0
+            if power_60 > power_50 * 1.5: return 60.0
+            elif power_50 > power_60 * 1.5: return 50.0
             return None
-
-        except Exception:
+        except:
             return None
 
     def apply(self, eeg_data, original_sr):
@@ -257,7 +213,7 @@ class SmartEEGPreprocessor:
             adjusted_high = high_cut
 
         # Notch Filter
-        line_freq = CONFIG["NOTCH_FREQ"] if CONFIG["NOTCH_FREQ"] is not None else self.detect_line_noise(eeg_data, original_sr)
+        line_freq = 60 #self.detect_line_noise(eeg_data, original_sr)
         if line_freq and line_freq < nyq:
             b_notch, a_notch = signal.iirnotch(line_freq, Q=CONFIG["NOTCH_Q"], fs=original_sr)
             eeg_data = signal.filtfilt(b_notch, a_notch, eeg_data, axis=-1)
@@ -321,22 +277,6 @@ def clean_channel_names(raw):
         pass # 이름 변경 실패 시 경고 없이 넘어감 (좌표 매핑에서 걸러짐)
     return raw
 
-def biosemi64_mapping():
-    biosemi64_mapping = {
-        # Left hemisphere & Midline (A bundle)
-        'A1': 'Fp1', 'A2': 'AF7', 'A3': 'AF3', 'A4': 'F1', 'A5': 'F3', 'A6': 'F5', 'A7': 'F7', 'A8': 'FT7',
-        'A9': 'FC5', 'A10': 'FC3', 'A11': 'FC1', 'A12': 'C1', 'A13': 'C3', 'A14': 'C5', 'A15': 'T7', 'A16': 'TP7',
-        'A17': 'CP5', 'A18': 'CP3', 'A19': 'CP1', 'A20': 'P1', 'A21': 'P3', 'A22': 'P5', 'A23': 'P7', 'A24': 'P9',
-        'A25': 'PO7', 'A26': 'PO3', 'A27': 'O1', 'A28': 'Iz', 'A29': 'Oz', 'A30': 'POz', 'A31': 'Pz', 'A32': 'CPz',
-        
-        # Right hemisphere & Midline (B bundle)
-        'B1': 'Fpz', 'B2': 'Fp2', 'B3': 'AF8', 'B4': 'AF4', 'B5': 'AFz', 'B6': 'Fz', 'B7': 'F2', 'B8': 'F4',
-        'B9': 'F6', 'B10': 'F8', 'B11': 'FT8', 'B12': 'FC6', 'B13': 'FC4', 'B14': 'FC2', 'B15': 'FCz', 'B16': 'Cz',
-        'B17': 'C2', 'B18': 'C4', 'B19': 'C6', 'B20': 'T8', 'B21': 'TP8', 'B22': 'CP6', 'B23': 'CP4', 'B24': 'CP2',
-        'B25': 'P2', 'B26': 'P4', 'B27': 'P6', 'B28': 'P8', 'B29': 'P10', 'B30': 'PO8', 'B31': 'PO4', 'B32': 'O2'
-    }
-    return biosemi64_mapping
-
 def get_valid_channel_indices(raw):
     valid_names = []
     valid_coords = []
@@ -371,13 +311,11 @@ def process_single_file(file_path):
              raw._data = raw._data.astype(np.float32)
 
         # 1. 채널 이름 정리 (EDF는 필수, 나머지도 포맷팅 위해 수행)
-        raw = clean_channel_names(raw)
+        # raw = clean_channel_names(raw)
 
         try:
         # 3. Standard-1005 몽타주 적용 (좌표 매핑의 핵심)
             montage = mne.channels.make_standard_montage(CONFIG["montage"])
-            if CONFIG["montage"] == 'biosemi64':
-                raw.rename_channels(biosemi64_mapping())
             raw.set_montage(montage, match_case=False, on_missing='ignore')
         except: pass
         
@@ -386,7 +324,6 @@ def process_single_file(file_path):
             try:
                 raw.pick("eeg", exclude="bads")
             except ValueError: pass
-
 
         if len(raw.ch_names) < 3: 
             print(f"[Skip] {file_path}: Not enough valid channels ({len(raw.ch_names)})")
@@ -412,8 +349,8 @@ def process_single_file(file_path):
             clip_limit=CONFIG["CLIP_LIMIT"]
         )
         
-        # processed_full = preprocessor.apply(data[:,int(sfreq*20):-int(sfreq*20)], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
-        processed_full = preprocessor.apply(data, sfreq)
+        # processed_full = preprocessor.apply(data[:,200*5:], sfreq) # 혹시나 앞에 노이즈 많을까봐 5초(200*5샘플) 자르고 시작하는 옵션 (필요시 활성화)
+        processed_full = preprocessor.apply(data[:128,:], sfreq)
 
 
         # 세그멘테이션
@@ -430,7 +367,7 @@ def process_single_file(file_path):
         parent_folder = os.path.basename(os.path.dirname(file_path))
         
         num_segments = total_length // window_samples
-        coords_array = np.array(valid_coords, dtype=np.float16)
+        coords_array = np.array(valid_coords[:128], dtype=np.float16)
         if processed_full.shape[-2] != len(coords_array):
             print(f"{file_path}: Shape mismatch after preprocessing, maybe channel error. Expected {len(coords_array)} channels, got {processed_full.shape[-2]}")
             return None
