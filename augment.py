@@ -17,7 +17,6 @@ def apply_student_augmentations(
     noise_std_min: float,
     noise_std_max: float,
     channel_drop_prob: float,
-    polarity_flip_prob: float = 0.0,
 ) -> torch.Tensor:
     """
     NEW(A): student 쪽에만 적용하는 "시간 정렬을 깨지 않는" 안전한 augmentation.
@@ -38,12 +37,6 @@ def apply_student_augmentations(
     B, C, T = x.shape
     x_fp32 = x.to(torch.float32)
 
-    # polarity flip
-    if polarity_flip_prob > 0:
-        flip = (torch.rand((B, 1, 1), device=device) < polarity_flip_prob).to(torch.float32)
-        sign = 1.0 - 2.0 * flip  # 1 or -1
-        x_fp32 = x_fp32 * sign
-
     # sample-wise gain
     if (gain_min != 1.0) or (gain_max != 1.0):
         g = torch.empty((B, 1, 1), device=device).uniform_(gain_min, gain_max)
@@ -56,17 +49,16 @@ def apply_student_augmentations(
         cg = torch.clamp(cg, 0.5, 2.0)
         x_fp32 = x_fp32 * cg
 
-    # channel dropout
+    # channel dropout (k-drop)
     if channel_drop_prob > 0:
-        drop = (torch.rand((B, C), device=device) < channel_drop_prob)  # True drop
-        # ensure not all channels dropped
-        all_drop = drop.all(dim=1)
-        if all_drop.any():
-            # keep one random channel
-            idx = torch.randint(0, C, (int(all_drop.sum().item()),), device=device)
-            drop[all_drop, :] = True
-            drop[all_drop, idx] = False
-        x_fp32 = x_fp32.masked_fill(drop[:, :, None], 0.0)
+        # expected drops = C*prob를 참고해서 k를 제한
+        k = max(0, min(C - 1, int(round(C * channel_drop_prob))))
+        if k > 0:
+            drop = torch.zeros((B, C), device=device, dtype=torch.bool)
+            for b in range(B):
+                idx = torch.randperm(C, device=device)[:k]
+                drop[b, idx] = True
+            x_fp32 = x_fp32.masked_fill(drop[:, :, None], 0.0)
 
     # gaussian noise (relative to RMS)
     if noise_std_max > 0:

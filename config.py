@@ -17,7 +17,7 @@ class EEGModelConfig:
     max_tokens: int = 4096
 
     # --------- Model options ----------
-    mlp_type: str = "gelu"  # "gelu", "swiglu", or "geglu"
+    mlp_type: str = "swiglu"  # "gelu", "swiglu", or "geglu"
     norm_type: str = "rmsnorm"  # "layernorm" or "rmsnorm"
     layerscale_init: float = 0.0  # if >0, use LayerScale with this init value; else disable (typically starts with 1e-5; deeper models may need smaller)
 
@@ -124,11 +124,10 @@ class TrainConfig:
     # --------- Student augmentations (NEW A) ----------
     aug_gain_min: float = 0.8
     aug_gain_max: float = 1.2
-    aug_channel_gain_std: float = 0.05       # per-channel multiplicative jitter std
+    aug_channel_gain_std: float = 0 # 0.05   # per-channel multiplicative jitter std
     aug_noise_std_min: float = 0.00          # relative to RMS
     aug_noise_std_max: float = 0.03
     aug_channel_drop_prob: float = 0.05      # per-channel dropout prob
-    aug_polarity_flip_prob: float = 0.0      # optional
 
     # --------- Freq corruption (student only) ----------
     freq_domain_drop_prob: float = 0.5

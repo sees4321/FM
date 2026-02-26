@@ -19,11 +19,11 @@ CONFIG = {
     # --------------------------------------------------------------------------
     # [NEW] 파일 형식 및 데이터 소스 설정
     # --------------------------------------------------------------------------
-    "ROOT_DIR": "D:/open_eeg/ds004395",           # 데이터가 있는 최상위 폴더
-    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds004395_2/eeg-%06d.tar", # 결과 파일 패턴
+    "ROOT_DIR": "D:/open_eeg/ds004395_04",           # 데이터가 있는 최상위 폴더
+    "OUTPUT_PATTERN": "D:/open_eeg_pp/openneuro_ds004395_04/eeg-%06d.tar", # 결과 파일 패턴
 
     "montage": "GSN-HydroCel-129", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
-    # "montage": "biosemi256", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
+    # "montage": "biosemi128", # 채널 좌표 매핑을 위한 몽타주 이름 (MNE에서 지원하는 몽타주 사용 권장)
     
     # 처리할 파일 확장자 (".edf", ".set", ".mat", ".tsv", ".csv", ".txt", ".bdf", ".vhdr" 등)
     "FILE_EXT": "*.edf", 
@@ -64,7 +64,7 @@ CONFIG = {
     
     # 병렬 처리 설정
     # "NUM_WORKERS": max(1, cpu_count() - 2)
-    "NUM_WORKERS": 2
+    "NUM_WORKERS": 1
 }
 
 # ==============================================================================
@@ -285,7 +285,6 @@ def get_valid_channel_indices(raw):
     for ch_name in raw.ch_names:
         if ch_name not in raw.info['chs'][raw.ch_names.index(ch_name)]['ch_name']:
             continue
-            
         # MNE 내부 좌표 가져오기
         ch_idx = raw.ch_names.index(ch_name)
         loc = raw.info['chs'][ch_idx]['loc'][:3]
@@ -311,7 +310,7 @@ def process_single_file(file_path):
              raw._data = raw._data.astype(np.float32)
 
         # 1. 채널 이름 정리 (EDF는 필수, 나머지도 포맷팅 위해 수행)
-        # raw = clean_channel_names(raw)
+        raw = clean_channel_names(raw)
 
         try:
         # 3. Standard-1005 몽타주 적용 (좌표 매핑의 핵심)

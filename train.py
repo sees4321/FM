@@ -104,11 +104,12 @@ def rescale_small_segments(
     rms_low: float = 0.5,
     rms_floor: float = 0.05,
     gain_max: float = 8.0,
-    clip: float = 15.0,
+    clip: float = 10.0,
 ) -> torch.Tensor:
     # fp32에서 통계 계산(안정)
     x32 = x.float()
-    rms = torch.sqrt(torch.mean(x32 * x32, dim=(1,2), keepdim=True) + 1e-8)  # (B,1,1)
+    # rms = torch.sqrt(torch.mean(x32 * x32, dim=(1,2), keepdim=True) + 1e-8)  # (B,1,1)
+    rms = torch.sqrt(torch.mean(x32 * x32, dim=-1, keepdim=True) + 1e-8)  # (B,C,1)
 
     # rms가 너무 작은 것만 보정
     need = (rms < rms_low).to(x32.dtype)  # (B,1,1) 0/1
