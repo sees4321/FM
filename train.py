@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import os
+import re
 import random
+from pathlib import Path
 from contextlib import ExitStack, nullcontext
 from typing import Tuple, Optional
 
@@ -276,7 +279,109 @@ def parse_args():
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--run_name", type=str, default=None)
+
+    # resume / init
+    p.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to an Accelerate state directory (or a step_* dir containing accelerator_state_*).",
+    )
+    p.add_argument(
+        "--init_from",
+        type=str,
+        default=None,
+        help="Initialize weights from a step_* checkpoint directory (student/teacher/predictor), but reset optimizer.",
+    )
     return p.parse_args()
+
+
+def _resolve_accelerator_state_dir(p: Optional[str]) -> Optional[str]:
+    if not p:
+        return None
+    path = Path(p).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"resume_from path does not exist: {path}")
+
+    # If user points to a step_* dir, auto-pick accelerator_state_* inside.
+    if path.is_dir():
+        # direct state dir
+        if path.name.startswith("accelerator_state"):
+            return str(path)
+        # search inside
+        cand = [d for d in path.iterdir() if d.is_dir() and d.name.startswith("accelerator_state")]
+        if cand:
+            cand = sorted(cand, key=lambda x: x.name)
+            return str(cand[-1])
+
+    # If it's a file or something else, just return as-is (accelerate will complain).
+    return str(path)
+
+
+def _parse_step_from_any_path(text: str) -> Optional[int]:
+    m = re.search(r"step_(\d+)", text)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"accelerator_state_(\d+)", text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _resume_step_from_trainer_state(state_dir: str) -> int:
+    p = Path(state_dir).expanduser().resolve()
+    # trainer_state.json is saved at step directory level
+    candidates = [
+        p / "trainer_state.json",
+        p.parent / "trainer_state.json",
+        p.parent.parent / "trainer_state.json",
+    ]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            try:
+                with open(c, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if "next_global_step" in d:
+                    return int(d["next_global_step"])
+                if "global_step" in d:
+                    return int(d["global_step"]) + 1
+            except Exception:
+                pass
+    s = _parse_step_from_any_path(str(p))
+    return int(s + 1) if s is not None else 0
+
+
+def _resolve_init_step_dir(p: Optional[str]) -> Optional[str]:
+    if not p:
+        return None
+    path = Path(p).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"init_from path does not exist: {path}")
+    if not path.is_dir():
+        raise ValueError(f"init_from must be a directory (step_*), got: {path}")
+    return str(path)
+
+
+def _resolve_weights_in_step_dir(step_dir: str) -> Tuple[str, Optional[str], str]:
+    """Return (student_dir, teacher_dir_or_None, predictor_pt)."""
+    p = Path(step_dir).expanduser().resolve()
+    if not p.is_dir():
+        raise ValueError(f"step_dir is not a directory: {p}")
+
+    student_dirs = [d for d in p.iterdir() if d.is_dir() and d.name.startswith("student")]
+    teacher_dirs = [d for d in p.iterdir() if d.is_dir() and d.name.startswith("teacher")]
+    pred_pts = [f for f in p.iterdir() if f.is_file() and f.name.startswith("predictor") and f.suffix == ".pt"]
+
+    if not student_dirs:
+        raise FileNotFoundError(f"No student_* directory found in {p}")
+    if not pred_pts:
+        raise FileNotFoundError(f"No predictor_*.pt found in {p}")
+
+    student_dirs = sorted(student_dirs, key=lambda x: x.name)
+    pred_pts = sorted(pred_pts, key=lambda x: x.name)
+    teacher_dir = sorted(teacher_dirs, key=lambda x: x.name)[-1] if teacher_dirs else None
+
+    return str(student_dirs[-1]), (str(teacher_dir) if teacher_dir else None), str(pred_pts[-1])
 
 
 def main():
@@ -352,6 +457,19 @@ def main():
     if args.no_wandb: train_cfg.use_wandb = False
     if args.run_name is not None: train_cfg.run_name = args.run_name
 
+    # resume / init overrides
+    if getattr(args, 'resume_from', None) is not None:
+        train_cfg.resume_from = args.resume_from
+    if getattr(args, 'init_from', None) is not None:
+        train_cfg.init_from = args.init_from
+
+    resume_state_dir = _resolve_accelerator_state_dir(getattr(train_cfg, 'resume_from', None))
+    init_step_dir = _resolve_init_step_dir(getattr(train_cfg, 'init_from', None))
+    if resume_state_dir and init_step_dir:
+        raise ValueError('Cannot use both resume_from and init_from at the same time')
+
+    resume_step = _resume_step_from_trainer_state(resume_state_dir) if resume_state_dir else 0
+
     use_token_budget = bool(getattr(train_cfg, "tokens_per_update", 0) and int(train_cfg.tokens_per_update) > 0)
     grad_accum_steps = 1 if use_token_budget else int(train_cfg.grad_accum_steps)
 
@@ -384,11 +502,30 @@ def main():
     tuned = auto_tune_tokens_per_batch(student, predictor, model_cfg, train_cfg, accelerator)
     train_cfg.tokens_per_batch = tuned
 
+    # optional: init weights from an existing step directory (weights-only)
+    teacher_init_dir: Optional[str] = None
+    if init_step_dir:
+        student_dir, teacher_dir, predictor_pt = _resolve_weights_in_step_dir(init_step_dir)
+        if accelerator.is_main_process:
+            print(f"[init_from] student={student_dir} teacher={teacher_dir} predictor={predictor_pt}")
+        # student
+        sd = torch.load(os.path.join(student_dir, "pytorch_model.bin"), map_location="cpu")
+        student.load_state_dict(sd, strict=True)
+        # predictor
+        pd = torch.load(predictor_pt, map_location="cpu")
+        predictor.load_state_dict(pd, strict=True)
+        # teacher (optional)
+        teacher_init_dir = teacher_dir
+
     # EMA teacher (after potential tuning)
     teacher = copy.deepcopy(student)
     for p in teacher.parameters():
         p.requires_grad = False
     teacher.eval()
+
+    if teacher_init_dir:
+        tsd = torch.load(os.path.join(teacher_init_dir, 'pytorch_model.bin'), map_location='cpu')
+        teacher.load_state_dict(tsd, strict=True)
 
     # data
     shards = find_shards(train_cfg.data_root, train_cfg.shard_glob)
@@ -473,16 +610,30 @@ def main():
     # accelerate prepare
     student, teacher, predictor, opt, loader = accelerator.prepare(student, teacher, predictor, opt, loader)
 
+    # resume full training state (models/optimizer/rng)
+    if resume_state_dir:
+        accelerator.wait_for_everyone()
+        accelerator.load_state(resume_state_dir)
+        # ensure teacher stays frozen
+        for p in teacher.parameters():
+            p.requires_grad = False
+        teacher.eval()
+
     # freq bin centers for masking
     bin_centers = accelerator.unwrap_model(student).freq_feat.bin_centers_hz.detach().cpu()
-
     student.train()
     predictor.train()
     teacher.eval()
 
     pbar = tqdm(total=train_cfg.max_steps, disable=not accelerator.is_local_main_process)
+    if resume_state_dir and int(resume_step) >= int(train_cfg.max_steps):
+        if accelerator.is_main_process:
+            print(f"[resume] resume_step ({resume_step}) >= max_steps ({train_cfg.max_steps}). Nothing to do.")
+        return
     it = iter(loader)
-    global_step = 0
+    global_step = int(resume_step) if resume_state_dir else 0
+    if global_step > 0:
+        pbar.update(global_step)
 
     # accumulation state (NEW)
     # - token-budget (preferred) OR fallback to fixed grad_accum_steps
@@ -619,7 +770,6 @@ def main():
                 noise_std_min=train_cfg.aug_noise_std_min,
                 noise_std_max=train_cfg.aug_noise_std_max,
                 channel_drop_prob=train_cfg.aug_channel_drop_prob,
-                polarity_flip_prob=train_cfg.aug_polarity_flip_prob,
             )
 
             # 3) freq corruption (student context only)

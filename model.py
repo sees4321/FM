@@ -119,6 +119,35 @@ class CoordFourierEmbedding(nn.Module):
         return self.proj(feat)
 
 
+class CoordMLPEmbedding(nn.Module):
+    def __init__(self, 
+                 d_model: int, 
+                 coord_jitter_std: float = 0.05,
+                 coord_jitter_prob: float = 0.5,
+                 w_init: float = 0.0
+                 ):
+        super().__init__()
+        self.coord_jitter_std = float(coord_jitter_std)
+        self.coord_jitter_prob = float(coord_jitter_prob)
+
+        in_dim = 3
+        self.proj = nn.Linear(in_dim, d_model)
+        self.emb_w = nn.Parameter(torch.tensor([w_init], dtype=torch.float32))  
+
+    def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        coords: (B, C, 3)
+        return: (B, C, d_model)
+        """
+        B, C, _ = coords.shape
+        if self.training and (self.coord_jitter_std > 0) and (self.coord_jitter_prob > 0):
+            gate = (torch.rand((B,), device=coords.device) < self.coord_jitter_prob).to(coords.dtype)
+            coords = coords + torch.randn_like(coords) * self.coord_jitter_std * gate[:, None, None]
+
+        coords = F.normalize(coords, p=2, dim=-1)
+        return self.proj(coords) * self.emb_w
+
+
 # ============================================================
 # Frequency features: packed rFFT + filterbank
 # ============================================================
@@ -1001,15 +1030,23 @@ class EEGEncoder(nn.Module):
 
         self.time_embed = TimePatchEmbed(cfg)
         self.freq_feat = RFFTFreqFeatures(cfg)
-        self.coord_embed = CoordFourierEmbedding(
-            d_model=cfg.d_model,
-            num_freqs=cfg.coord_num_freqs,
-            max_freq=cfg.coord_max_freq,
-            include_raw=cfg.coord_include_raw,
-            coord_jitter_std=cfg.coord_jitter_std,
-            coord_jitter_prob=cfg.coord_jitter_prob,
-            renormalize=cfg.coord_renormalize,
-        )
+        if cfg.isFourier:
+            self.coord_embed = CoordFourierEmbedding(
+                d_model=cfg.d_model,
+                num_freqs=cfg.coord_num_freqs,
+                max_freq=cfg.coord_max_freq,
+                include_raw=cfg.coord_include_raw,
+                coord_jitter_std=cfg.coord_jitter_std,
+                coord_jitter_prob=cfg.coord_jitter_prob,
+                renormalize=cfg.coord_renormalize,
+            )
+        else:
+            self.coord_embed = CoordMLPEmbedding(
+                d_model=cfg.d_model,
+                coord_jitter_std=cfg.coord_jitter_std,
+                coord_jitter_prob=cfg.coord_jitter_prob,
+                w_init=cfg.coord_w_init,
+            )
         self.film = FiLMFusion(
             freq_dim=self.freq_feat.freq_dim,
             d_model=cfg.d_model,
