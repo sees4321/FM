@@ -33,6 +33,27 @@ class EEGModelConfig:
     rope_theta: float = 10000.0
     rotary_pct: float = 1.0
 
+    # --------- Encoder attention architecture ----------
+    # "full"      : standard 1D packed-token self-attention (baseline)
+    # "divided"   : TimeSformer-like divided attention (temporal pass then spatial pass)
+    # "hybrid"    : mostly divided, but every N blocks use a full-attention block
+    encoder_arch: str = "hybrid"
+    full_attn_every: int = 4  # for hybrid; 0 disables full-attn blocks
+    full_attn_use_spatial_bias: bool = True  # may disable flash SDP depending on PyTorch version
+
+    # --------- Spatial attention bias ----------
+    # Additive attention-logits bias computed from electrode coords.
+    # - "legendre": learnable Legendre series in cos(gamma)=u·v (unit-sphere)
+    # - "none"    : disable
+    # NOTE: the previous optional "mlp" spatial bias was removed for efficiency.
+    spatial_bias_type: str = "legendre"  # "legendre" | "none"
+    spatial_bias_degree: int = 8
+    spatial_bias_use_unit_sphere: bool = True
+    spatial_bias_scale: float = 1.0
+    # (deprecated, kept for backward compatibility)
+    spatial_bias_mlp_hidden: int = 64
+    spatial_bias_mlp_depth: int = 2
+
     # --------- Spatial embedding ----------
     coord_num_freqs: int = 6
     coord_max_freq: float = 2.0
@@ -81,6 +102,14 @@ class EEGModelConfig:
 
 @dataclass
 class TrainConfig:
+    # --------- Repro / determinism ----------
+    # NOTE:
+    # - Pretraining throughput is usually better with cudnn_benchmark=True and deterministic=False.
+    # - For ablations/tuning, fixing seeds is recommended.
+    seed: int = 42
+    torch_deterministic: bool = False
+    cudnn_benchmark: bool = True
+
     # --------- Data ----------
     data_root: str = "/mnt/e/open_eeg"
     cache_dir: str = "/mnt/c/wds_cache"
@@ -92,8 +121,39 @@ class TrainConfig:
     post_split_shuffle: int = 128
     eviction_interval: int = 8
 
+    # ------------------------------------------------------------
+    # Long-segment (60s) handling
+    # ------------------------------------------------------------
+    # 기존 split-long은 oversampling을 만들기 쉬워서,
+    # baseline에서는 60s 샘플을 확률적으로 random window crop(10/30s) 하도록 했었음.
+    #
+    # 이번 버전에서는 DINO-style multi-crop(=global + local crops)을 기본으로 추가.
+    #
+    # long_multicrop_mode:
+    #   - "off"      : multi-crop 비활성 (아래 deprecated random crop 사용 가능)
+    #   - "expand"   : crops를 독립 샘플로 확장(flatmap)만 함 (추천 시작점)
+    #   - "multiview": expand + (옵션) multi-view consistency loss 추가
     base_seconds: int = 10
-    split_long_prob: float = 0.5
+
+    # legacy split-long (oversampling 위험; 필요 시만 켜기)
+    split_long_prob: float = 0.0  # deprecated (kept for backward compatibility)
+
+    # legacy random window crop (deprecated): multi-crop이 off일 때만 적용
+    long_crop_prob: float = 0.0   # only applied when duration_sec==60 and long_multicrop_mode=="off"
+    long_crop_30_prob: float = 0.5
+
+    # NEW: DINO-style multi-crop for 60s
+    long_multicrop_mode: str = "expand"     # "off" | "expand" | "multiview"
+    long_multicrop_prob: float = 0.3        # P(add local crops | duration==60)
+    long_multicrop_n_global: int = 1
+    long_multicrop_global_sec: int = 30
+    long_multicrop_n_local: int = 4
+    long_multicrop_local_sec: int = 10
+    long_multicrop_local_within_global: bool = True  # local crops sampled inside the chosen global window
+
+    # multi-view training (only when long_multicrop_mode == "multiview")
+    multiview_loss_weight: float = 0.05
+    multiview_only_for_multicrop: bool = True  # do not try to pair non-multicrop samples
 
     enable_channel_grouping: bool = True
 
@@ -144,6 +204,15 @@ class TrainConfig:
     grad_clip: float = 1.0
     grad_accum_steps: int = 1
 
+    # NEW: token-budget based gradient accumulation (dynamic)
+    # - Accumulate multiple micro-batches (possibly from different (C,P) buckets)
+    # - Perform optimizer.step() when accumulated token-count reaches the budget.
+    # Basis:
+    #   "target"  : use #target tokens (recommended for JEPA since loss defined on targets)
+    #   "valid"   : use #valid tokens (C*P)
+    accum_tokens_basis: str = "target"
+    tokens_per_update: int = 8192
+
     max_steps: int = 200_000
     warmup_steps: int = 5_000
 
@@ -160,6 +229,11 @@ class TrainConfig:
     use_wandb: bool = True
     wandb_project: str = "eeg-foundation"
     run_name: Optional[str] = None
+
+    # --------- Logging ----------
+    log_bucket_key: bool = True
+    log_proxies: bool = True
+    proxy_max_tokens: int = 2048  # subsample target tokens for cheap proxy metrics (0 disables subsampling)
 
     # Debug / small runs
     limit_num_samples: int = 0

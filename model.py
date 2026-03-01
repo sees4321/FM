@@ -276,6 +276,96 @@ class FiLMFusion(nn.Module):
 
 
 # ============================================================
+# Spatial relative bias (channel-channel)
+# ============================================================
+class SpatialBias(nn.Module):
+    """Compute a (B,C,C) additive attention bias from electrode coordinates.
+
+    Supported types:
+      - legendre: truncated Legendre series in cos(gamma) (default)
+      - none: returns None
+
+    NOTE:
+      - The previous optional MLP spatial bias has been removed to keep the model
+        simpler and faster. If you want a learnable non-parametric mapping, you
+        can re-introduce it later, but Legendre is the default here.
+
+    Notes:
+      - By default we normalize coords to unit vectors so the bias depends only on direction.
+      - Bias is shared across heads (broadcasted) to keep memory reasonable for full attention.
+    """
+
+    def __init__(self, cfg: EEGModelConfig):
+        super().__init__()
+        self.bias_type = str(getattr(cfg, "spatial_bias_type", "legendre")).lower()
+        self.use_unit = bool(getattr(cfg, "spatial_bias_use_unit_sphere", True))
+        self.eps = float(getattr(cfg, "spatial_bias_eps", 1e-6))
+        self.scale = float(getattr(cfg, "spatial_bias_scale", 1.0))
+
+        init_std = float(getattr(cfg, "spatial_bias_init_std", 0.0))
+
+        if self.bias_type in ("none", "off", "disable", "disabled"):
+            self.enabled = False
+            self.degree = 0
+            self.coeff = None
+            return
+
+        if self.bias_type != "legendre":
+            raise ValueError(
+                f"SpatialBias only supports 'legendre' or 'none'. Got spatial_bias_type={self.bias_type!r}. "
+                "(MLP spatial bias was removed for efficiency.)"
+            )
+
+        self.enabled = True
+        self.degree = int(getattr(cfg, "spatial_bias_degree", 8))
+        # coeffs a_l (l=0..L). Init ~0 to start near unbiased.
+        w = torch.zeros(self.degree + 1)
+        if init_std > 0:
+            w = w.normal_(mean=0.0, std=init_std)
+        self.coeff = nn.Parameter(w)
+
+    def _cosine(self, coords: torch.Tensor) -> torch.Tensor:
+        # coords: (B,C,3)
+        if self.use_unit:
+            # direction-only
+            u = coords / (coords.norm(dim=-1, keepdim=True).clamp_min(self.eps))
+        else:
+            u = coords
+        # cos(gamma) between channels
+        x = torch.matmul(u, u.transpose(1, 2))  # (B,C,C)
+        return x.clamp(-1.0, 1.0)
+
+    def forward(self, coords: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return bias_cc: (B,C,C) or None."""
+        if not getattr(self, "enabled", True):
+            return None
+
+        # compute in fp32 for stability, then cast later
+        x = self._cosine(coords.float())  # (B,C,C)
+        # legendre series
+        assert self.coeff is not None
+        L = int(self.degree)
+        # P0
+        Pm2 = torch.ones_like(x)
+        bias = self.coeff[0].to(x.dtype) * Pm2
+        if L == 0:
+            return bias
+
+        # P1
+        Pm1 = x
+        bias = bias + self.coeff[1].to(x.dtype) * Pm1
+
+        for l in range(2, L + 1):
+            Pl = ((2 * l - 1) * x * Pm1 - (l - 1) * Pm2) / float(l)
+            bias = bias + self.coeff[l].to(x.dtype) * Pl
+            Pm2, Pm1 = Pm1, Pl
+
+        if self.scale != 1.0:
+            bias = bias * self.scale
+        return bias
+
+
+# ============================================================
 # Attention blocks (PreNorm) with RoPE + Flash SDP
 # ============================================================
 class MultiheadSelfAttentionRoPE(nn.Module):
@@ -341,11 +431,20 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         else:
             raise ValueError(f"rope_pos must be (N,) or (B,N), got {rope_pos.shape}")
 
-    def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor], rope_pos: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        rope_pos: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         x: (B, N, D)
         padding_mask: (B, N) bool, True for PAD
-        rope_pos: (N,) or (B,N) long, time positions
+        rope_pos: (N,) or (B,N) long, time positions. Required if rotary_dim > 0.
+        attn_bias: optional additive bias.
+          - (B, N, N) float (broadcasts over heads)
+          - or (B, 1, N, N) float
         """
         B, N, D = x.shape
         qkv = self.qkv(x)
@@ -356,6 +455,8 @@ class MultiheadSelfAttentionRoPE(nn.Module):
         v = v.view(B, N, self.n_heads, self.head_dim).transpose(1, 2)
 
         if self.rotary_dim > 0:
+            if rope_pos is None:
+                raise ValueError("rope_pos must be provided when rotary_dim > 0")
             cos, sin = self._get_rope(rope_pos, dtype=q.dtype, device=q.device)  # (N,half) or (B,N,half)
             q_rot, q_pass = q[..., : self.rotary_dim], q[..., self.rotary_dim :]
             k_rot, k_pass = k[..., : self.rotary_dim], k[..., self.rotary_dim :]
@@ -365,8 +466,21 @@ class MultiheadSelfAttentionRoPE(nn.Module):
             k = torch.cat([k_rot, k_pass], dim=-1)
 
         attn_mask = None
-        if padding_mask is not None:
-            attn_mask = (~padding_mask)[:, None, None, :]  # (B,1,1,N)
+        if attn_bias is None:
+            # key padding only (efficient)
+            if padding_mask is not None:
+                attn_mask = (~padding_mask)[:, None, None, :]  # (B,1,1,N)
+        else:
+            # additive bias mask (float)
+            if attn_bias.dim() == 3:
+                attn_mask = attn_bias[:, None, :, :]
+            elif attn_bias.dim() == 4:
+                attn_mask = attn_bias
+            else:
+                raise ValueError(f"attn_bias must have dim 3 or 4, got {attn_bias.shape}")
+            attn_mask = attn_mask.to(dtype=q.dtype)
+            if padding_mask is not None:
+                attn_mask = attn_mask.masked_fill(padding_mask[:, None, None, :], float("-inf"))
 
         out = F.scaled_dot_product_attention(
             q, k, v,
@@ -597,6 +711,276 @@ class TransformerBlock(nn.Module):
         return x
 
 
+# ============================================================
+# Hybrid encoder blocks: divided spatiotemporal attention + occasional full attention
+# ============================================================
+class FullAttentionBlock(nn.Module):
+    """Full self-attention over packed (channel,time) tokens.
+
+    - RoPE on time indices
+    - Optional spatial relative bias (channel-channel) added to attention logits
+    """
+
+    def __init__(self, cfg: EEGModelConfig):
+        super().__init__()
+        self.use_spatial_bias = bool(getattr(cfg, "full_attn_use_spatial_bias", True))
+        self.norm1 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
+        self.attn = MultiheadSelfAttentionRoPE(
+            d_model=cfg.d_model,
+            n_heads=cfg.n_heads,
+            attn_dropout=cfg.attn_dropout,
+            rope_theta=cfg.rope_theta,
+            rotary_pct=cfg.rotary_pct,
+        )
+
+        self.norm2 = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
+        self.mlp = make_mlp(cfg.mlp_type, cfg.d_model, cfg.mlp_ratio, cfg.dropout)
+        self.dropout = nn.Dropout(cfg.dropout)
+
+        if getattr(cfg, "layerscale_init", 0.0) and cfg.layerscale_init > 0:
+            self.ls1 = LayerScale(cfg.d_model, init_value=cfg.layerscale_init)
+            self.ls2 = LayerScale(cfg.d_model, init_value=cfg.layerscale_init)
+        else:
+            self.ls1 = None
+            self.ls2 = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        rope_pos: torch.Tensor,
+        chan_idx: Optional[torch.Tensor],
+        spatial_bias_cc: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # spatial bias on channels -> gather to token-token
+        attn_bias = None
+        if self.use_spatial_bias and (spatial_bias_cc is not None) and (chan_idx is not None):
+            # token channel indices (PAD already clamped in embed_from_indices)
+            c = chan_idx
+            B, N = c.shape
+            b = torch.arange(B, device=c.device)[:, None, None]
+            bias_cc = spatial_bias_cc.to(dtype=x.dtype, device=x.device)
+            attn_bias = bias_cc[b, c[:, :, None], c[:, None, :]]  # (B,N,N)
+
+        y = self.attn(self.norm1(x), padding_mask=padding_mask, rope_pos=rope_pos, attn_bias=attn_bias)
+        if self.ls1 is not None:
+            y = self.ls1(y)
+        x = x + self.dropout(y)
+
+        y = self.mlp(self.norm2(x))
+        if self.ls2 is not None:
+            y = self.ls2(y)
+        x = x + self.dropout(y)
+        return x
+
+
+class DividedSpatiotemporalBlock(nn.Module):
+    """Divided attention block (Time-pass then Space-pass) on packed tokens.
+
+    Temporal pass (per-channel sequences):
+      - RoPE(time)
+
+    Spatial pass (per-time sequences):
+      - spatial relative bias (Legendre)
+
+    This is designed for EEG tokens where (C,P_t) is sparse/packed due to JEPA masking.
+    """
+
+    def __init__(self, cfg: EEGModelConfig):
+        super().__init__()
+        self.cfg = cfg
+        D = cfg.d_model
+
+        # temporal pass
+        self.norm_t = make_norm(cfg.norm_type, D, eps=1e-6)
+        self.attn_t = MultiheadSelfAttentionRoPE(
+            d_model=D,
+            n_heads=cfg.n_heads,
+            attn_dropout=cfg.attn_dropout,
+            rope_theta=cfg.rope_theta,
+            rotary_pct=cfg.rotary_pct,
+        )
+
+        # spatial pass
+        self.norm_s = make_norm(cfg.norm_type, D, eps=1e-6)
+        self.attn_s = MultiheadSelfAttentionRoPE(
+            d_model=D,
+            n_heads=cfg.n_heads,
+            attn_dropout=cfg.attn_dropout,
+            rope_theta=cfg.rope_theta,
+            rotary_pct=0.0,  # no RoPE in spatial pass
+        )
+
+        # MLP
+        self.norm_m = make_norm(cfg.norm_type, D, eps=1e-6)
+        self.mlp = make_mlp(cfg.mlp_type, D, cfg.mlp_ratio, cfg.dropout)
+
+        self.dropout = nn.Dropout(cfg.dropout)
+
+        if getattr(cfg, "layerscale_init", 0.0) and cfg.layerscale_init > 0:
+            self.ls_t = LayerScale(D, init_value=cfg.layerscale_init)
+            self.ls_s = LayerScale(D, init_value=cfg.layerscale_init)
+            self.ls_m = LayerScale(D, init_value=cfg.layerscale_init)
+        else:
+            self.ls_t = None
+            self.ls_s = None
+            self.ls_m = None
+
+    @staticmethod
+    def _scatter_to_grid(
+        x: torch.Tensor,            # (B,L,D)
+        pad: torch.Tensor,          # (B,L) True=PAD
+        c: torch.Tensor,            # (B,L) channel indices (safe)
+        t: torch.Tensor,            # (B,L) time indices (safe)
+        C: int,
+        P: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Scatter packed tokens to a dense (B,C,P,D) grid.
+
+        Returns:
+          grid: (B,C,P,D)
+          grid_pad: (B,C,P) True=missing
+        """
+        B, L, D = x.shape
+        device = x.device
+
+        grid = x.new_zeros((B, C, P, D))
+        grid_pad = torch.ones((B, C, P), dtype=torch.bool, device=device)
+
+        valid = ~pad
+        if valid.any():
+            b_idx = torch.arange(B, device=device)[:, None].expand(B, L)
+            b = b_idx[valid]
+            cc = c[valid]
+            tt = t[valid]
+            grid[b, cc, tt] = x[valid]
+            grid_pad[b, cc, tt] = False
+
+        return grid, grid_pad
+
+    @staticmethod
+    def _gather_from_grid(
+        grid: torch.Tensor,         # (B,C,P,D)
+        pad: torch.Tensor,          # (B,L)
+        c: torch.Tensor,            # (B,L)
+        t: torch.Tensor,            # (B,L)
+    ) -> torch.Tensor:
+        B, L = c.shape
+        device = c.device
+        b_idx = torch.arange(B, device=device)[:, None].expand(B, L)
+        out = grid[b_idx, c, t]
+        return out.masked_fill(pad[..., None], 0.0)
+
+    def _temporal_pass(
+        self,
+        x: torch.Tensor,            # (B,L,D)
+        pad: torch.Tensor,          # (B,L)
+        t_idx: torch.Tensor,        # (B,L)
+        c_idx: torch.Tensor,        # (B,L)
+        C: int,
+        P: int,
+    ) -> torch.Tensor:
+        # dense grid
+        grid, grid_pad = self._scatter_to_grid(x, pad, c_idx, t_idx, C=C, P=P)
+
+        # temporal: (B*C, P, D)
+        x_t = grid.reshape(-1, P, grid.shape[-1])
+        pad_t = grid_pad.reshape(-1, P)
+        nonempty = (~pad_t).any(dim=1)
+        if nonempty.any():
+            x_sel = x_t[nonempty]
+            pad_sel = pad_t[nonempty]
+            rope = torch.arange(P, device=x.device, dtype=torch.long)
+            y_sel = self.attn_t(x_sel, padding_mask=pad_sel, rope_pos=rope, attn_bias=None)
+            y_t = x_t.new_zeros(x_t.shape)
+            y_t[nonempty] = y_sel
+        else:
+            y_t = x_t.new_zeros(x_t.shape)
+
+        grid_out = y_t.reshape(grid.shape)
+        return self._gather_from_grid(grid_out, pad, c_idx, t_idx)
+
+    def _spatial_pass(
+        self,
+        x: torch.Tensor,            # (B,L,D)
+        pad: torch.Tensor,          # (B,L)
+        t_idx: torch.Tensor,        # (B,L)
+        c_idx: torch.Tensor,        # (B,L)
+        spatial_bias_cc: Optional[torch.Tensor],  # (B,C,C)
+        C: int,
+        P: int,
+    ) -> torch.Tensor:
+        # dense grid
+        grid, grid_pad = self._scatter_to_grid(x, pad, c_idx, t_idx, C=C, P=P)
+
+        # spatial: group by time -> (B*P, C, D)
+        grid_tp = grid.permute(0, 2, 1, 3).contiguous()  # (B,P,C,D)
+        pad_tp = grid_pad.permute(0, 2, 1).contiguous()  # (B,P,C)
+        x_s = grid_tp.reshape(-1, C, grid.shape[-1])
+        pad_s = pad_tp.reshape(-1, C)
+        nonempty = (~pad_s).any(dim=1)
+
+        if nonempty.any():
+            x_sel = x_s[nonempty]
+            pad_sel = pad_s[nonempty]
+            bias_sel = None
+            if spatial_bias_cc is not None:
+                # We avoid materializing (B*P,C,C). Map each non-empty (b,p) group back to b.
+                # x_s is flattened from (B,P,C,D) -> (B*P,C,D), so group_index // P == b.
+                group_idx = torch.nonzero(nonempty, as_tuple=False).squeeze(-1)  # (n_sel,)
+                b_idx = group_idx // P
+                bias_sel = spatial_bias_cc.to(dtype=x.dtype, device=x.device)[b_idx]  # (n_sel,C,C)
+            y_sel = self.attn_s(x_sel, padding_mask=pad_sel, rope_pos=None, attn_bias=bias_sel)
+            y_s = x_s.new_zeros(x_s.shape)
+            y_s[nonempty] = y_sel
+        else:
+            y_s = x_s.new_zeros(x_s.shape)
+
+        grid_tp_out = y_s.reshape(grid_tp.shape)  # (B,P,C,D)
+        grid_out = grid_tp_out.permute(0, 2, 1, 3).contiguous()  # (B,C,P,D)
+        return self._gather_from_grid(grid_out, pad, c_idx, t_idx)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        rope_pos: torch.Tensor,
+        chan_idx: Optional[torch.Tensor],
+        spatial_bias_cc: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if padding_mask is None:
+            # assume all valid
+            padding_mask = torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)
+        if chan_idx is None:
+            raise ValueError("DividedSpatiotemporalBlock requires chan_idx")
+
+        # infer grid sizes
+        if spatial_bias_cc is not None:
+            C = int(spatial_bias_cc.shape[1])
+        else:
+            C = int(chan_idx.max().item()) + 1
+        P = int(rope_pos.max().item()) + 1
+
+        # temporal pass
+        y = self._temporal_pass(self.norm_t(x), padding_mask, rope_pos, chan_idx, C=C, P=P)
+        if self.ls_t is not None:
+            y = self.ls_t(y)
+        x = x + self.dropout(y)
+
+        # spatial pass
+        y = self._spatial_pass(self.norm_s(x), padding_mask, rope_pos, chan_idx, spatial_bias_cc=spatial_bias_cc, C=C, P=P)
+        if self.ls_s is not None:
+            y = self.ls_s(y)
+        x = x + self.dropout(y)
+
+        # MLP
+        y = self.mlp(self.norm_m(x))
+        if self.ls_m is not None:
+            y = self.ls_m(y)
+        x = x + self.dropout(y)
+        return x
+
+
 class EEGEncoder(nn.Module):
     """
     EEG encoder (ViT-style) that can embed PACKED tokens:
@@ -632,7 +1016,25 @@ class EEGEncoder(nn.Module):
             hidden=cfg.film_hidden,
         )
 
-        self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
+        # shared spatial bias module (computed once per forward and reused across blocks)
+        self.spatial_bias = SpatialBias(cfg)
+
+        # encoder blocks
+        arch = str(getattr(cfg, "encoder_arch", "hybrid")).lower()
+        full_every = int(getattr(cfg, "full_attn_every", 4))
+        blocks = []
+        if arch == "full":
+            blocks = [FullAttentionBlock(cfg) for _ in range(cfg.n_layers)]
+        elif arch == "divided":
+            blocks = [DividedSpatiotemporalBlock(cfg) for _ in range(cfg.n_layers)]
+        elif arch == "hybrid":
+            for i in range(cfg.n_layers):
+                is_full = (full_every > 0) and ((i + 1) % full_every == 0)
+                blocks.append(FullAttentionBlock(cfg) if is_full else DividedSpatiotemporalBlock(cfg))
+        else:
+            raise ValueError(f"Unknown encoder_arch: {arch}")
+
+        self.blocks = nn.ModuleList(blocks)
         self.norm = make_norm(cfg.norm_type, cfg.d_model, eps=1e-6)
 
     def extract_patches_view(self, x: torch.Tensor) -> torch.Tensor:
@@ -664,7 +1066,7 @@ class EEGEncoder(nn.Module):
         # freq corruption (student context only)
         freq_mask_bins: Optional[torch.Tensor] = None,   # (B,K) bool True=mask
         freq_domain_drop: Optional[torch.Tensor] = None, # (B,) bool
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute packed token embeddings for (c_idx, t_idx).
 
@@ -672,6 +1074,7 @@ class EEGEncoder(nn.Module):
           tok: (B,L,D)
           pad: (B,L) True=PAD
           rope_pos: (B,L) long (time patch indices)
+          chan_idx: (B,L) long (channel indices; PAD already clamped)
         """
         device = x.device
         B, C, T = x.shape
@@ -725,12 +1128,34 @@ class EEGEncoder(nn.Module):
         tok = tok.masked_fill(pad[..., None], 0.0)
 
         rope_pos = t_safe  # (B,L) patch indices
-        return tok, pad, rope_pos
+        chan_idx = c_safe  # (B,L)
+        return tok, pad, rope_pos, chan_idx
 
-    def forward(self, tokens: torch.Tensor, padding_mask: torch.Tensor, rope_pos: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+        rope_pos: torch.Tensor,
+        chan_idx: torch.Tensor,
+        coords: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # Precompute spatial bias once per forward (B,C,C). This avoids recomputing
+        # the Legendre series in every encoder block.
+        spatial_bias_cc = None
+        if coords is not None:
+            spatial_bias_cc = self.spatial_bias(coords)
+            if spatial_bias_cc is not None:
+                spatial_bias_cc = spatial_bias_cc.to(dtype=tokens.dtype, device=tokens.device)
+
         x = tokens
         for blk in self.blocks:
-            x = blk(x, padding_mask=padding_mask, rope_pos=rope_pos)
+            x = blk(
+                x,
+                padding_mask=padding_mask,
+                rope_pos=rope_pos,
+                chan_idx=chan_idx,
+                spatial_bias_cc=spatial_bias_cc,
+            )
         x = self.norm(x)
         return x
 

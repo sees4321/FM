@@ -58,6 +58,18 @@ def decode_sample(sample: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(meta, (bytes, bytearray)):
         meta = json.loads(meta.decode("utf-8"))
 
+    # Preserve webdataset identifiers for traceability / multi-view pairing.
+    # These keys are provided by webdataset tarfile_to_samples.
+    if not isinstance(meta, dict):
+        meta = {"meta": meta}
+    else:
+        # copy to avoid accidental shared-mutation across pipeline stages
+        meta = dict(meta)
+    if "__key__" in sample:
+        meta["__key__"] = sample.get("__key__")
+    if "__url__" in sample:
+        meta["__url__"] = sample.get("__url__")
+
     eeg = _as_torch(eeg).to(torch.float16)     # stored float16
     coord = _as_torch(coord).to(torch.float32)
     coord = coord * 10 # (0.1m -> 1.0)
@@ -116,6 +128,202 @@ def maybe_split_long_to_base(
         out["meta"]["chunk_index"] = i
         out["meta"]["parent_duration_sec"] = duration_sec
         outs.append(out)
+    return outs if len(outs) > 0 else [ex]
+
+
+def maybe_random_window_crop_60s(
+    ex: Dict[str, Any],
+    crop_prob: float,
+    crop_30_prob: float,
+) -> Dict[str, Any]:
+    """
+    NEW: 60초 샘플에 대해서만 확률적으로 random window crop(10s or 30s).
+    - oversampling을 만들기 쉬운 split(10s*6) 대신,
+      epoch/step가 진행되면서 서로 다른 윈도우가 샘플링되도록 하는 방식.
+
+    Args:
+      crop_prob: P(crop | duration==60)
+      crop_30_prob: P(choose 30s | crop triggered)
+    """
+    if crop_prob <= 0:
+        return ex
+
+    eeg: torch.Tensor = ex["eeg"]
+    coord: torch.Tensor = ex["coord"]
+    meta: Dict[str, Any] = ex.get("meta", {})
+
+    fs = int(meta.get("fs", 200))
+    if fs <= 0:
+        fs = 200
+    duration_sec = int(round(eeg.shape[-1] / fs))
+
+    if duration_sec != 60:
+        return ex
+    if random.random() >= float(crop_prob):
+        return ex
+
+    # choose crop length
+    crop_sec = 30 if (random.random() < float(crop_30_prob)) else 10
+    crop_samples = int(crop_sec * fs)
+    C, T = eeg.shape
+    if T <= crop_samples:
+        return ex
+
+    start = random.randint(0, T - crop_samples)
+    eeg2 = eeg[:, start : start + crop_samples].contiguous()
+
+    out = {
+        "eeg": eeg2,
+        "coord": coord,
+        "meta": dict(meta),
+    }
+    out["meta"]["duration_sec"] = int(crop_sec)
+    out["meta"]["parent_duration_sec"] = int(duration_sec)
+    out["meta"]["crop_start"] = int(start)
+    out["meta"]["cropped_from_long_window"] = True
+    return out
+
+
+def _make_parent_uid(meta: Dict[str, Any]) -> str:
+    """Best-effort unique id for a recording sample.
+
+    We prefer webdataset identifiers (__url__, __key__). If unavailable, we fall back to
+    a hash of (dataset, subject, session, etc.) when present.
+    """
+    url = str(meta.get("__url__", ""))
+    key = str(meta.get("__key__", ""))
+    if url or key:
+        return f"{url}::{key}"
+
+    # fallback: hash a subset of metadata
+    fields = [
+        str(meta.get("dataset", "")),
+        str(meta.get("subject", meta.get("subj", ""))),
+        str(meta.get("session", "")),
+        str(meta.get("run", "")),
+        str(meta.get("recording_id", meta.get("id", ""))),
+    ]
+    s = "|".join(fields)
+    if s.strip("|"):
+        h = hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+        return f"meta::{h}"
+    # last resort: random uid (won't pair reliably, but avoids crashes)
+    return f"rand::{random.getrandbits(64):016x}"
+
+
+def maybe_dino_multicrop_60s(
+    ex: Dict[str, Any],
+    mode: str,
+    local_prob: float,
+    n_global: int,
+    global_sec: int,
+    n_local: int,
+    local_sec: int,
+    local_within_global: bool = True,
+) -> List[Dict[str, Any]]:
+    """DINO-style multi-crop for 60s segments.
+
+    Output is a list of independent samples (for WebDataset flatmap).
+
+    Semantics:
+      - Always emits n_global "global" crops (default: 1x 30s).
+      - With prob=local_prob, additionally emits n_local "local" crops (default: 4x 10s).
+      - If local_within_global=True, local crops are sampled inside the FIRST global crop window
+        (better-aligned for multi-view consistency losses).
+
+    mode:
+      - "off"      : returns [ex]
+      - "expand"   : just returns crops (no training-side coupling)
+      - "multiview": returns crops with meta fields needed for pairing (train.py uses them)
+
+    NOTE:
+      - We only apply this when duration_sec == 60 (based on meta/fs or T/fs).
+      - If crop length exceeds signal length, we fall back to [ex].
+    """
+    mode = str(mode).lower().strip()
+    if mode in ("off", "none", "disabled", "disable"):
+        return [ex]
+
+    eeg: torch.Tensor = ex["eeg"]  # (C,T)
+    coord: torch.Tensor = ex["coord"]
+    meta: Dict[str, Any] = ex.get("meta", {})
+    if not isinstance(meta, dict):
+        meta = {"meta": meta}
+
+    fs = int(meta.get("fs", 200))
+    if fs <= 0:
+        fs = 200
+    duration_sec = int(round(eeg.shape[-1] / fs))
+    if duration_sec != 60:
+        return [ex]
+
+    C, T = eeg.shape
+    global_samples = int(global_sec * fs)
+    local_samples = int(local_sec * fs)
+
+    if global_samples <= 0 or local_samples <= 0:
+        return [ex]
+    if T < min(global_samples, local_samples):
+        return [ex]
+
+    parent_uid = str(meta.get("parent_uid", ""))
+    if not parent_uid:
+        parent_uid = _make_parent_uid(meta)
+
+    outs: List[Dict[str, Any]] = []
+
+    # ---- global crops ----
+    n_global = int(max(1, n_global))
+    g0_start = 0
+    for gi in range(n_global):
+        if T <= global_samples:
+            start = 0
+        else:
+            start = random.randint(0, T - global_samples)
+        if gi == 0:
+            g0_start = int(start)
+        eeg_g = eeg[:, start : start + global_samples].contiguous()
+        meta_g = dict(meta)
+        meta_g.update({
+            "parent_uid": parent_uid,
+            "multicrop": True,
+            "view_type": "global",
+            "view_id": int(gi),
+            "parent_duration_sec": 60,
+            "duration_sec": int(global_sec),
+            "crop_start": int(start),
+            "crop_len": int(global_samples),
+        })
+        outs.append({"eeg": eeg_g, "coord": coord, "meta": meta_g})
+
+    # ---- local crops (probabilistic) ----
+    if (n_local > 0) and (local_prob > 0) and (random.random() < float(local_prob)):
+        n_local = int(max(1, n_local))
+        for li in range(n_local):
+            if T <= local_samples:
+                start = 0
+            else:
+                if local_within_global and (global_samples >= local_samples) and (T >= global_samples):
+                    lo = g0_start
+                    hi = g0_start + (global_samples - local_samples)
+                    hi = max(lo, min(hi, T - local_samples))
+                    start = random.randint(int(lo), int(hi))
+                else:
+                    start = random.randint(0, T - local_samples)
+            eeg_l = eeg[:, start : start + local_samples].contiguous()
+            meta_l = dict(meta)
+            meta_l.update({
+                "parent_uid": parent_uid,
+                "multicrop": True,
+                "view_type": "local",
+                "view_id": int(li),
+                "parent_duration_sec": 60,
+                "duration_sec": int(local_sec),
+                "crop_start": int(start),
+                "crop_len": int(local_samples),
+            })
+            outs.append({"eeg": eeg_l, "coord": coord, "meta": meta_l})
+
     return outs if len(outs) > 0 else [ex]
 
 
@@ -232,11 +440,14 @@ def collate_pad(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: in
         eeg_pad[i, :C, :T_need] = eeg
         coord_pad[i, :C, :] = coord
 
+    meta = [b.get("meta", {}) for b in batch]
+
     return {
         "eeg": eeg_pad,
         "coord": coord_pad,
         "n_channels": n_channels,
         "n_patches": n_patches,
+        "meta": meta,
     }
 
 def collate_stack(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: int) -> Dict[str, Any]:
@@ -259,11 +470,14 @@ def collate_stack(batch: List[Dict[str, Any]], patch_samples: int, hop_samples: 
     n_channels = torch.full((B,), C, dtype=torch.long)
     n_patches = torch.full((B,), P, dtype=torch.long)
 
+    meta = [b.get("meta", {}) for b in batch]
+
     return {
         "eeg": eeg,
         "coord": coord,
         "n_channels": n_channels,
         "n_patches": n_patches,
+        "meta": meta,
     }
 
 
@@ -663,6 +877,17 @@ def build_webdataset(
     sample_shuffle: int,
     base_seconds: int,
     split_long_prob: float,
+    # NEW: DINO-style multi-crop on 60s segments
+    long_multicrop_mode: str,
+    long_multicrop_prob: float,
+    long_multicrop_n_global: int,
+    long_multicrop_global_sec: int,
+    long_multicrop_n_local: int,
+    long_multicrop_local_sec: int,
+    long_multicrop_local_within_global: bool,
+    # legacy: 60s random window crop (deprecated)
+    long_crop_prob: float,
+    long_crop_30_prob: float,
     max_tokens: int,
     patch_samples: int,
     hop_samples: int,
@@ -719,8 +944,43 @@ def build_webdataset(
         wds.shuffle(sample_shuffle),
         wds.decode(wds.numpy_loads, wds.json_loads),
         wds.map(decode_sample),  # 여기서 torch로 변환
-        wds.flatmap(lambda ex: maybe_split_long_to_base(ex, base_seconds=base_seconds, split_prob=split_long_prob)),
-        # split 이후 작은 shuffle(연속 chunk 완화)
+    ]
+
+    # ---------------------------------
+    # Long(60s) handling
+    # ---------------------------------
+    # Preferred: DINO-style multi-crop (global + local windows)
+    mc_mode = str(long_multicrop_mode).lower().strip()
+    if mc_mode not in ("off", "none", "disabled", "disable"):
+        pipeline.append(
+            wds.flatmap(
+                lambda ex: maybe_dino_multicrop_60s(
+                    ex,
+                    mode=mc_mode,
+                    local_prob=long_multicrop_prob,
+                    n_global=long_multicrop_n_global,
+                    global_sec=long_multicrop_global_sec,
+                    n_local=long_multicrop_n_local,
+                    local_sec=long_multicrop_local_sec,
+                    local_within_global=long_multicrop_local_within_global,
+                )
+            )
+        )
+    else:
+        # Legacy: 60s only -> random window crop (10/30s)
+        if long_crop_prob and long_crop_prob > 0:
+            pipeline.append(
+                wds.map(lambda ex: maybe_random_window_crop_60s(ex, crop_prob=long_crop_prob, crop_30_prob=long_crop_30_prob))
+            )
+
+    # legacy option: split long -> base seconds (oversampling 주의)
+    # NOTE: multi-crop을 켠 경우에는 split을 함께 쓰지 않는 것을 권장.
+    if mc_mode in ("off", "none", "disabled", "disable"):
+        if split_long_prob and split_long_prob > 0:
+            pipeline.append(wds.flatmap(lambda ex: maybe_split_long_to_base(ex, base_seconds=base_seconds, split_prob=split_long_prob)))
+
+    # small shuffle after crop/split
+    pipeline += [
         wds.shuffle(post_split_shuffle),
         wds.map(_prep),
     ]
