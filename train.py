@@ -8,6 +8,7 @@ import math
 import os
 import re
 import random
+import time
 from pathlib import Path
 from contextlib import ExitStack, nullcontext
 from typing import Tuple, Optional
@@ -677,6 +678,7 @@ def main():
         mv_pairs_sum = torch.zeros((), device=dev, dtype=torch.float32)
         mv_loss_pairs_sum = torch.zeros((), device=dev, dtype=torch.float32)  # sum(loss_i) over paired samples
 
+    start_time = time.time()
     while global_step < train_cfg.max_steps:
         try:
             batch = next(it)
@@ -1034,8 +1036,7 @@ def main():
                     "bucket_P": bucket_P,
                     "bucket_tok_per_sample": bucket_tok_per_sample,
                     "tokens_per_batch_cfg": int(train_cfg.tokens_per_batch),
-                    "patch_samples": int(patch_samples),
-                    "hop_samples": int(hop_samples),
+                    "steps_time": int(time.time() - start_time),
                 }
 
                 # cheap proxy metrics (representation health checks)
@@ -1084,6 +1085,7 @@ def main():
                         "multiview/weight": float(mv_weight),
                     })
                 accelerator.log(logs, step=global_step)
+                start_time = time.time()
 
             if accelerator.is_main_process and (global_step % train_cfg.save_every == 0):
                 accelerator.wait_for_everyone()

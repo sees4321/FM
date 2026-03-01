@@ -144,7 +144,7 @@ class CoordMLPEmbedding(nn.Module):
             gate = (torch.rand((B,), device=coords.device) < self.coord_jitter_prob).to(coords.dtype)
             coords = coords + torch.randn_like(coords) * self.coord_jitter_std * gate[:, None, None]
 
-        coords = F.normalize(coords, p=2, dim=-1)
+        coords = F.normalize(coords, p=2, dim=-1) # unit vector
         return self.proj(coords) * self.emb_w
 
 

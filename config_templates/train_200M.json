@@ -18,7 +18,7 @@
   "auto_tune_target_mem_frac": 0.85,
   "auto_tune_probe_seq_len": 4096,
   "auto_tune_probe_batch": 1,
-  "num_workers": 6,
+  "num_workers": 8,
   "mask_time_prob": 0.8,
   "mask_spatial_prob": 0.8,
   "mask_dilate_time": 0,
@@ -54,10 +54,10 @@
   "ema_momentum_final": 0.9999,
   "output_dir": "./checkpoints/eeg_jepa_200M",
   "log_every": 50,
-  "save_every": 5000,
+  "save_every": 20000,
   "mixed_precision": "bf16",
   "use_wandb": true,
-  "wandb_project": "eeg-foundation",
+  "wandb_project": "EEG_FM",
   "run_name": "pretrain_200M",
   "limit_num_samples": 0,
   "long_multicrop_mode": "expand",
@@ -67,6 +67,6 @@
   "long_multicrop_n_local": 4,
   "long_multicrop_local_sec": 10,
   "long_multicrop_local_within_global": true,
-  "multiview_loss_weight": 0.05,
-  "multiview_only_for_multicrop": true
+  "multiview_loss_weight": 0.0,
+  "multiview_only_for_multicrop": false
 }
