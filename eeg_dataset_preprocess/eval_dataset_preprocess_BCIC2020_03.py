@@ -61,7 +61,7 @@ from tqdm import tqdm
 # ==============================================================================
 CONFIG = {
     "ROOT_DIR": r"D:/open_eeg/BCIC2020_03",
-    "OUTPUT_DIR": r"D:/open_eeg_eval/BCIC2020_03_npy",
+    "OUTPUT_DIR": r"D:/open_eeg_eval/BCIC2020_03_npy2",
     "ANSWER_SHEET": r"D:/open_eeg/BCIC2020_03/Track3_Answer Sheet_Test.xlsx",
 
     "TARGET_SR": 200,
@@ -492,21 +492,21 @@ class SmartEEGPreprocessor:
         nyq = 0.5 * float(original_sr)
         low_cut, high_cut = self.bandpass_freq
 
-        adjusted_high = (nyq - 1.0) if high_cut >= nyq else high_cut
-        if adjusted_high <= low_cut:
-            adjusted_high = min(nyq - 0.1, max(low_cut + 0.1, low_cut * 1.1))
+        # adjusted_high = (nyq - 1.0) if high_cut >= nyq else high_cut
+        # if adjusted_high <= low_cut:
+        #     adjusted_high = min(nyq - 0.1, max(low_cut + 0.1, low_cut * 1.1))
 
-        # 1) multi-notch
-        line_freq = self.notch_freqs
-        if line_freq and line_freq < nyq:
-            b_notch, a_notch = signal.iirnotch(line_freq, Q=self.notch_q, fs=original_sr)
-            eeg_data = signal.filtfilt(b_notch, a_notch, eeg_data, axis=-1, padtype=None)
+        # # 1) multi-notch
+        # line_freq = self.notch_freqs
+        # if line_freq and line_freq < nyq:
+        #     b_notch, a_notch = signal.iirnotch(line_freq, Q=self.notch_q, fs=original_sr)
+        #     eeg_data = signal.filtfilt(b_notch, a_notch, eeg_data, axis=-1, padtype=None)
 
-        # 2) bandpass
-        wn_low, wn_high = low_cut / nyq, adjusted_high / nyq
-        wn_high = min(wn_high, 0.99)
-        sos = signal.butter(3, [wn_low, wn_high], btype="band", analog=False, output="sos")
-        eeg_data = signal.sosfiltfilt(sos, eeg_data, axis=-1, padtype=None)
+        # # 2) bandpass
+        # wn_low, wn_high = low_cut / nyq, adjusted_high / nyq
+        # wn_high = min(wn_high, 0.99)
+        # sos = signal.butter(3, [wn_low, wn_high], btype="band", analog=False, output="sos")
+        # eeg_data = signal.sosfiltfilt(sos, eeg_data, axis=-1, padtype=None)
 
         # 3) resample
         if int(round(original_sr)) != self.target_sr:
@@ -528,12 +528,12 @@ class SmartEEGPreprocessor:
             pad_right = expected_t - eeg_data.shape[-1]
             eeg_data = np.pad(eeg_data, ((0, 0), (0, pad_right)), mode="edge")
 
-        # 6) z-score + clip
-        mean = np.mean(eeg_data, axis=-1, keepdims=True)
-        std = np.std(eeg_data, axis=-1, keepdims=True)
-        eeg_data = (eeg_data - mean) / (std + 1e-8)
-        eeg_data = np.clip(eeg_data, -self.clip_limit, self.clip_limit)
-        eeg_data = eeg_data.astype(np.float16)
+        # # 6) z-score + clip
+        # mean = np.mean(eeg_data, axis=-1, keepdims=True)
+        # std = np.std(eeg_data, axis=-1, keepdims=True)
+        # eeg_data = (eeg_data - mean) / (std + 1e-8)
+        # eeg_data = np.clip(eeg_data, -self.clip_limit, self.clip_limit)
+        # eeg_data = eeg_data.astype(np.float16)
         return eeg_data[:, :-21]
 
 
